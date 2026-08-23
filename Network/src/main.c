@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <endian.h>
+#include <errno.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <poll.h>
@@ -11,9 +13,10 @@
 
 #include <spicenet/config.h>
 #include <spicenet/snp.h>
-#include <payload_state.h>
 
-#define STATE_FILE_PATH "/var/lib/piobc/state.bin"
+#include <daemon/client.h>
+#include <daemon/proto.h>
+#include <net_ipc.h>
 
 // Entries for bulk transfer
 struct bulk_calc_entry {
@@ -80,30 +83,97 @@ snp_app_t *app_bulk_ft_tx;
 snp_app_t *app_bulk_vid_tx;
 snp_app_t *app_bulk_ack; // APID 0x035 is bidirectional
 
+// Connection to daemond. Payload application processes (e.g. payload_app)
+// exchange net_ipc_hdr_t-framed messages with us through this, keyed by the
+// app's registered name NET_IPC_PAYLOAD_APP_NAME.
+static daemon_client_t g_daemon;
+
+// Forwards `len` bytes received on `apid` from the OBC to the payload
+// application process via the daemon. Fire-and-forget: if no app is
+// registered to receive it, the daemon reports a DMSG_ERROR the next time
+// we read from it, which the event loop just logs.
+static void forward_to_app(uint16_t apid, const uint8_t *buf, int len) {
+    uint8_t frame[sizeof(net_ipc_hdr_t) + NET_IPC_MAX_DATA];
+    net_ipc_hdr_t hdr = { .apid = apid, .len = (uint16_t)len };
+    memcpy(frame, &hdr, sizeof(hdr));
+    memcpy(frame + sizeof(hdr), buf, (size_t)len);
+    daemon_client_send(&g_daemon, NET_IPC_PAYLOAD_APP_NAME, frame, (uint32_t)(sizeof(hdr) + len));
+}
+
 // Input handler functions
 // All multi-byte fields arrive in Big-Endian, handle this here also
 // APID 0x010
 void handle_payload_command(uint8_t *buf, int len) {
+    forward_to_app(APID_CMD_RX, buf, len);
 }
 
 // APID 0x020
 void handle_adcs_telemetry(uint8_t *buf, int len) {
+    forward_to_app(APID_ADCS_TELEM_RX, buf, len);
 }
 
 // APID 0x022
 void handle_adcs_response(uint8_t *buf, int len) {
+    forward_to_app(APID_ADCS_RESP_RX, buf, len);
 }
 
 // APID 0x033
 void handle_bulk_experiment_table(uint8_t *buf, int len) {
+    forward_to_app(APID_BULK_EXP_RX, buf, len);
 }
 
 // APID 0x034
 void handle_bulk_control_algo(uint8_t *buf, int len) {
+    forward_to_app(APID_BULK_CTRL_RX, buf, len);
 }
 
 // APID 0x035
 void handle_bulk_ack(uint8_t *buf, int len) {
+    forward_to_app(APID_BULK_ACK_BIDI, buf, len);
+}
+
+// Looks up which outbound SPICEnet app to write on for a given APID, for
+// routing net_ipc frames received from payload application processes back
+// out over the serial link.
+static snp_app_t *tx_app_for_apid(uint16_t apid) {
+    switch (apid) {
+        case APID_TELEM_TX:     return app_telem_tx;
+        case APID_CMD_RESP_TX:  return app_cmd_resp_tx;
+        case APID_ADCS_REQ_TX:  return app_adcs_req_tx;
+        case APID_BULK_CALC_TX: return app_bulk_calc_tx;
+        case APID_BULK_FT_TX:   return app_bulk_ft_tx;
+        case APID_BULK_VID_TX:  return app_bulk_vid_tx;
+        case APID_BULK_ACK_BIDI: return app_bulk_ack;
+        default: return NULL;
+    }
+}
+
+// Handles one frame delivered by the daemon from a payload application
+// process: unwraps the net_ipc_hdr_t and writes the data out over
+// SPICEnet on the APID it names.
+static void handle_app_delivery(const uint8_t *buf, uint32_t len) {
+    if (len < sizeof(net_ipc_hdr_t)) {
+        fprintf(stderr, "[network] short net_ipc frame from app (%u bytes)\n", len);
+        return;
+    }
+    net_ipc_hdr_t hdr;
+    memcpy(&hdr, buf, sizeof(hdr));
+    const uint8_t *data = buf + sizeof(hdr);
+    if (sizeof(hdr) + hdr.len > len) {
+        fprintf(stderr, "[network] truncated net_ipc frame from app (apid=0x%03X len=%u)\n", hdr.apid, hdr.len);
+        return;
+    }
+
+    snp_app_t *app = tx_app_for_apid(hdr.apid);
+    if (app == NULL) {
+        fprintf(stderr, "[network] app requested send on unroutable apid 0x%03X\n", hdr.apid);
+        return;
+    }
+
+    int ret = snp_write(app, (void *)data, hdr.len);
+    if (ret < 0) {
+        fprintf(stderr, "[network] snp_write failed for apid 0x%03X: %d\n", hdr.apid, ret);
+    }
 }
 
 // Packing helpers
@@ -311,18 +381,41 @@ int send_bulk_ack(uint32_t transfer_id, uint8_t status, uint32_t *missing_chunks
     return ret < 0 ? ret : 0;
 }
 
+static void sleep_ms(int ms) {
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000 };
+    nanosleep(&ts, NULL);
+}
+
 int main(int argc, char **argv) {
     int fd;
-    const char *portname = "/dev/ttyS0";
+    const char *portname = argc > 1 ? argv[1] : "/dev/ttyS0";
     uint8_t rx_buffer[512]; // Max payload MTU 512 bytes
 
-    satellite_state_t boot_state;
-    if (sat_state_init(STATE_FILE_PATH, &boot_state) != 0) {
-        perror("[Failed to open payload state store]");
+    // Connected before touching the serial link so the daemon side of this
+    // bridge (payload app traffic) doesn't depend on RS-422 hardware being
+    // present. satellite_state_t is canonical to the daemon (daemon/state.h)
+    // - this process no longer keeps its own copy of the state file.
+    int daemon_connected = 0;
+    for (int attempt = 0; attempt < 10 && !daemon_connected; attempt++) {
+        if (daemon_client_connect(NET_IPC_NETWORK_NAME, &g_daemon) == 0) {
+            daemon_connected = 1;
+            break;
+        }
+        sleep_ms(300);
+    }
+    if (!daemon_connected) {
+        fprintf(stderr, "[Failed to connect to daemon]: %s\n", strerror(errno));
         return EXIT_FAILURE;
     }
-    printf("[Payload State Restored] op_state=0x%02X active_experiment_id=%u dce_authority=%u\n",
-           boot_state.op_state, boot_state.active_experiment_id, boot_state.dce_authority_held);
+    printf("[Connected to daemon as \"%s\"]\n", NET_IPC_NETWORK_NAME);
+
+    // Read up front, before any peer traffic can arrive - see the ordering
+    // caveat on daemon_client_get_state in daemon/client.h.
+    satellite_state_t boot_state;
+    if (daemon_client_get_state(&g_daemon, &boot_state) == 0) {
+        printf("[Payload State Restored] op_state=0x%02X active_experiment_id=%u dce_authority=%u\n",
+               boot_state.op_state, boot_state.active_experiment_id, boot_state.dce_authority_held);
+    }
 
     if (snp_open(&fd, (char *)portname) != 0) {
         perror("[Failed to open serial connection]");
@@ -336,9 +429,11 @@ int main(int argc, char **argv) {
     }
     printf("[Serial Connection Confirmed]\n");
 
-    // Connect to all listening APIDs
+    // Connect to all listening APIDs, plus one extra pollfd for the daemon
+    // connection (payload app traffic).
     snp_app_t *apps[NUM_LISTEN_APIDS];
-    struct pollfd pollfds[NUM_LISTEN_APIDS];
+    struct pollfd pollfds[NUM_LISTEN_APIDS + 1];
+    const int daemon_pfd_idx = NUM_LISTEN_APIDS;
 
     for (int i = 0; i < NUM_LISTEN_APIDS; i++) {
         if (snp_connect(listen_apids[i], &apps[i]) != 0) {
@@ -386,11 +481,28 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    pollfds[daemon_pfd_idx].fd     = daemon_client_fd(&g_daemon);
+    pollfds[daemon_pfd_idx].events = POLLIN;
+
     // Event Loop
     while (1) {
-        int ret = poll(pollfds, NUM_LISTEN_APIDS, -1); 
+        int ret = poll(pollfds, NUM_LISTEN_APIDS + 1, -1);
 
         if (ret > 0) {
+            if (pollfds[daemon_pfd_idx].revents & POLLIN) {
+                uint16_t type;
+                char     src[DAEMON_NAME_MAX];
+                uint8_t  daemon_buf[DAEMON_MAX_MSG_PAYLOAD];
+                uint32_t len;
+                if (daemon_client_recv(&g_daemon, &type, src, daemon_buf, sizeof(daemon_buf), &len) != 0) {
+                    fprintf(stderr, "[network] connection to daemon lost\n");
+                } else if (type == DMSG_DELIVER) {
+                    handle_app_delivery(daemon_buf, len);
+                } else if (type == DMSG_ERROR) {
+                    fprintf(stderr, "[network] daemon reported an error (app not up yet?)\n");
+                }
+            }
+
             for (int i = 0; i < NUM_LISTEN_APIDS; i++) {
                 if (pollfds[i].revents & POLLIN) {
                     

@@ -47,6 +47,7 @@ struct ipc_server {
 };
 
 static const size_t TX_BACKLOG_LIMIT = 256 * 1024;
+static const size_t TX_MIN_CAP = 4096;
 
 ipc_server_t *ipc_server_create(const char *socket_path) {
     char dir_buf[PATH_MAX];
@@ -165,8 +166,12 @@ static client_conn_t *find_client_by_name(ipc_server_t *srv, const char *name, c
 }
 
 static int append_tx(client_conn_t *c, const void *data, size_t len) {
-    if (c->tx_sent > 0 && c->tx_sent == c->tx_len) {
-        c->tx_len  = 0;
+    if (c->tx_sent > 0) {
+        size_t remaining = c->tx_len - c->tx_sent;
+        if (remaining > 0) {
+            memmove(c->txbuf, c->txbuf + c->tx_sent, remaining);
+        }
+        c->tx_len  = remaining;
         c->tx_sent = 0;
     }
 
@@ -175,7 +180,7 @@ static int append_tx(client_conn_t *c, const void *data, size_t len) {
         return -1;
     }
     if (needed > c->tx_cap) {
-        size_t newcap = c->tx_cap ? c->tx_cap * 2 : 4096;
+        size_t newcap = c->tx_cap ? c->tx_cap * 2 : TX_MIN_CAP;
         while (newcap < needed) {
             newcap *= 2;
         }
@@ -185,6 +190,18 @@ static int append_tx(client_conn_t *c, const void *data, size_t len) {
         }
         c->txbuf = nb;
         c->tx_cap = newcap;
+    } else if (c->tx_cap > TX_MIN_CAP && needed < c->tx_cap / 4) {
+        size_t newcap = TX_MIN_CAP;
+        while (newcap < needed) {
+            newcap *= 2;
+        }
+        if (newcap < c->tx_cap) {
+            uint8_t *nb = realloc(c->txbuf, newcap);
+            if (nb != NULL) { // shrink failure is non-fatal; keep the larger buffer
+                c->txbuf = nb;
+                c->tx_cap = newcap;
+            }
+        }
     }
 
     memcpy(c->txbuf + c->tx_len, data, len);

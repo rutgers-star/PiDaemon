@@ -35,3 +35,14 @@ add_executable(demo_worker
 target_link_libraries(demo_worker PRIVATE daemonclient)
 target_compile_options(demo_worker PRIVATE ${COMPILER_FLAGS})
 target_link_options(demo_worker PRIVATE ${COMPILER_FLAGS})
+
+# Dummy payload application: talks to the "network" bridge process
+# (Network/src/main.c) over the daemon IPC bus using the net_ipc_hdr_t
+# framing shared with it - hence the extra include dir.
+add_executable(payload_app
+    ${PROJECT_SOURCE_DIR}/src/payload_app.c
+)
+target_link_libraries(payload_app PRIVATE daemonclient)
+target_include_directories(payload_app PRIVATE ${PROJECT_SOURCE_DIR}/../Network/include)
+target_compile_options(payload_app PRIVATE ${COMPILER_FLAGS})
+target_link_options(payload_app PRIVATE ${COMPILER_FLAGS})

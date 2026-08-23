@@ -147,6 +147,47 @@ static void register_demo_workers(process_manager_t *pm, const char *bin_dir) {
     pm_add(pm, &worker_b);
 }
 
+// The dummy payload app has no hardware dependency, so the daemon can
+// safely supervise it like any other worker.
+static void register_payload_app(process_manager_t *pm, const char *bin_dir) {
+    static process_spec_t payload_app;
+
+    memset(&payload_app, 0, sizeof(payload_app));
+    snprintf(payload_app.name, sizeof(payload_app.name), "payload_app");
+    snprintf(payload_app.path, sizeof(payload_app.path), "%s/payload_app", bin_dir);
+    payload_app.argv[1] = "payload_app";
+    payload_app.argv[2] = NULL;
+    payload_app.restart = RESTART_ALWAYS;
+    pm_add(pm, &payload_app);
+}
+
+#ifndef NETWORK_BIN_PATH
+#define NETWORK_BIN_PATH NULL
+#endif
+
+// The real Network bridge (Communications, Network/src/main.c) - owns the
+// RS-422/SPICEnet link to the OBC. Supervised the same as any other
+// process: if it exits (e.g. no serial hardware attached, or the link
+// dropped), pm_reap's restart backoff brings it back, matching the ICD's
+// expectation that the link is re-established automatically (Section 4.2).
+// NETWORK_BIN_PATH is only defined when built via the top-level
+// CMakeLists.txt that builds Network alongside Daemon - see there.
+static void register_network(process_manager_t *pm) {
+    if (NETWORK_BIN_PATH == NULL) {
+        fprintf(stderr, "[Daemon] NETWORK_BIN_PATH not set (standalone Daemon build?), not supervising "
+                        "Communications\n");
+        return;
+    }
+
+    static process_spec_t network;
+    memset(&network, 0, sizeof(network));
+    snprintf(network.name, sizeof(network.name), "network");
+    snprintf(network.path, sizeof(network.path), "%s", NETWORK_BIN_PATH);
+    network.argv[1] = NULL; // Communications defaults to /dev/ttyS0 when no port is given
+    network.restart = RESTART_ALWAYS;
+    pm_add(pm, &network);
+}
+
 int main(void) {
     if (install_signal_handlers() != 0) {
         perror("[Daemon] failed to install signal handlers");
@@ -181,6 +222,8 @@ int main(void) {
         return 1;
     }
     register_demo_workers(&pm, bin_dir);
+    register_payload_app(&pm, bin_dir);
+    register_network(&pm);
     pm_start_all(&pm);
 
     ipc_server_t *srv = ipc_server_create(daemon_socket_path());

@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 
+// TODO: MAKE ALL OF THIS MULTITHREADED SO IT DOENS'T BLOCK FOR LARGE FILES
 int daemon_write_all(int fd, const void *buf, size_t len) {
     size_t off = 0;
     while (off < len) {

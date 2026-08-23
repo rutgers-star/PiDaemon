@@ -9,6 +9,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+//TODO: ADD PRINTOUTS AND LOGS FOR STUFF ESP STUFF LIKE ERROS
 int daemon_client_connect(const char *name, daemon_client_t *out) {
     if (name == NULL || out == NULL) {
         errno = EINVAL;
