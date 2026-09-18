@@ -106,61 +106,6 @@ static int acquire_singleton_lock(const char *pid_path) {
     return fd;
 }
 
-// Resolves the directory this binary was launched from, so managed
-// processes that ship alongside daemond (like demo_worker) can be found
-// without a hardcoded install path.
-static int self_exe_dir(char *buf, size_t bufsize) {
-    char exe[PATH_MAX];
-    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (n < 0) {
-        return -1;
-    }
-    exe[n] = '\0';
-    char *dir = dirname(exe);
-    if (strlen(dir) >= bufsize) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-    strcpy(buf, dir);
-    return 0;
-}
-
-static void register_demo_workers(process_manager_t *pm, const char *bin_dir) {
-    static process_spec_t worker_a;
-    static process_spec_t worker_b;
-
-    memset(&worker_a, 0, sizeof(worker_a));
-    snprintf(worker_a.name, sizeof(worker_a.name), "worker_a");
-    snprintf(worker_a.path, sizeof(worker_a.path), "%s/demo_worker", bin_dir);
-    worker_a.argv[1] = "worker_a";
-    worker_a.argv[2] = "worker_b";
-    worker_a.argv[3] = NULL;
-    worker_a.restart = RESTART_ALWAYS;
-    pm_add(pm, &worker_a);
-
-    memset(&worker_b, 0, sizeof(worker_b));
-    snprintf(worker_b.name, sizeof(worker_b.name), "worker_b");
-    snprintf(worker_b.path, sizeof(worker_b.path), "%s/demo_worker", bin_dir);
-    worker_b.argv[1] = "worker_b";
-    worker_b.argv[2] = NULL;
-    worker_b.restart = RESTART_ALWAYS;
-    pm_add(pm, &worker_b);
-}
-
-// The dummy payload app has no hardware dependency, so the daemon can
-// safely supervise it like any other worker.
-static void register_payload_app(process_manager_t *pm, const char *bin_dir) {
-    static process_spec_t payload_app;
-
-    memset(&payload_app, 0, sizeof(payload_app));
-    snprintf(payload_app.name, sizeof(payload_app.name), "payload_app");
-    snprintf(payload_app.path, sizeof(payload_app.path), "%s/payload_app", bin_dir);
-    payload_app.argv[1] = "payload_app";
-    payload_app.argv[2] = NULL;
-    payload_app.restart = RESTART_ALWAYS;
-    pm_add(pm, &payload_app);
-}
-
 #ifndef NETWORK_BIN_PATH
 #define NETWORK_BIN_PATH NULL
 #endif
@@ -216,13 +161,6 @@ int main(void) {
     process_manager_t pm;
     pm_init(&pm);
 
-    char bin_dir[PATH_MAX];
-    if (self_exe_dir(bin_dir, sizeof(bin_dir)) != 0) {
-        perror("[Daemon] failed to resolve own executable path");
-        return 1;
-    }
-    register_demo_workers(&pm, bin_dir);
-    register_payload_app(&pm, bin_dir);
     register_network(&pm);
     pm_start_all(&pm);
 
