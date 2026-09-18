@@ -106,6 +106,39 @@ static int acquire_singleton_lock(const char *pid_path) {
     return fd;
 }
 
+// Resolves the directory this binary was launched from, so managed
+// processes that ship alongside daemond (like payload_app) can be found
+// without a hardcoded install path.
+static int self_exe_dir(char *buf, size_t bufsize) {
+    char exe[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n < 0) {
+        return -1;
+    }
+    exe[n] = '\0';
+    char *dir = dirname(exe);
+    if (strlen(dir) >= bufsize) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    strcpy(buf, dir);
+    return 0;
+}
+
+// The dummy payload app has no hardware dependency, so the daemon can
+// safely supervise it like any other worker.
+static void register_payload_app(process_manager_t *pm, const char *bin_dir) {
+    static process_spec_t payload_app;
+
+    memset(&payload_app, 0, sizeof(payload_app));
+    snprintf(payload_app.name, sizeof(payload_app.name), "payload_app");
+    snprintf(payload_app.path, sizeof(payload_app.path), "%s/payload_app", bin_dir);
+    payload_app.argv[1] = "payload_app";
+    payload_app.argv[2] = NULL;
+    payload_app.restart = RESTART_ALWAYS;
+    pm_add(pm, &payload_app);
+}
+
 #ifndef NETWORK_BIN_PATH
 #define NETWORK_BIN_PATH NULL
 #endif
@@ -161,6 +194,12 @@ int main(void) {
     process_manager_t pm;
     pm_init(&pm);
 
+    char bin_dir[PATH_MAX];
+    if (self_exe_dir(bin_dir, sizeof(bin_dir)) != 0) {
+        perror("[Daemon] failed to resolve own executable path");
+        return 1;
+    }
+    register_payload_app(&pm, bin_dir);
     register_network(&pm);
     pm_start_all(&pm);
 
