@@ -3,8 +3,11 @@ project(PiObcCommunications C)
 
 # Builds daemond/daemonclient/demo_worker/payload_app, then the Network
 # bridge (Communications), which links against daemonclient to talk to
-# payload_app over the daemon's IPC bus.
+# payload_app over the daemon's IPC bus, and against PayloadApids/PayloadLink
+# for the APID registry and RS-422 frame codec.
 add_subdirectory(Daemon)
+add_subdirectory(PayloadApids)
+add_subdirectory(PayloadLink)
 add_subdirectory(Network)
 
 # daemond supervises Communications like any other managed process (see

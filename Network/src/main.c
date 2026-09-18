@@ -3,16 +3,17 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
-#include <endian.h>
 #include <errno.h>
 #include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <termios.h>
 
-#include <spicenet/config.h>
-#include <spicenet/snp.h>
+#include <star/payload_apids.h>
+#include <payload_link/frame.h>
+#include <payload_link/pack.h>
 
 #include <daemon/client.h>
 #include <daemon/proto.h>
@@ -31,62 +32,61 @@ struct bulk_ft_entry {
     float    torque_vector[3];
 };
 
-// APID Definitions 
-// OBC -> Pi
-#define APID_CMD_RX            0x010
-#define APID_ADCS_TELEM_RX     0x020
-#define APID_ADCS_RESP_RX      0x022
-#define APID_BULK_EXP_RX       0x033
-#define APID_BULK_CTRL_RX      0x034
-
-// Pi -> OBC
-#define APID_TELEM_TX          0x011
-#define APID_CMD_RESP_TX       0x012
-#define APID_ADCS_REQ_TX       0x021
-#define APID_BULK_CALC_TX      0x030
-#define APID_BULK_FT_TX        0x031
-#define APID_BULK_VID_TX       0x032
-
-// Pi <-> OBC
-#define APID_BULK_ACK_BIDI     0x035
-
-// Bulk Data Transfer Wrapper layout constants
+// Bulk Data Transfer Wrapper layout constants (application-level, carried as
+// the payload of a STAR_APID_* bulk-transfer message inside a payload-link
+// frame body - see pack_bulk_wrapper()).
 #define BULK_WRAPPER_HEADER_SIZE 14
-#define MAX_CHUNK_DATA (MAX_PACKET_LENGTH - BULK_WRAPPER_HEADER_SIZE)
+#define MAX_CHUNK_DATA (NET_IPC_MAX_DATA - BULK_WRAPPER_HEADER_SIZE)
 
-#define BULK_CALC_ENTRY_SIZE 36 
+#define BULK_CALC_ENTRY_SIZE 36
 #define MAX_CALC_ENTRIES_PER_CHUNK (MAX_CHUNK_DATA / BULK_CALC_ENTRY_SIZE)
 
-#define BULK_FT_ENTRY_SIZE 32 
+#define BULK_FT_ENTRY_SIZE 32
 #define MAX_FT_ENTRIES_PER_CHUNK (MAX_CHUNK_DATA / BULK_FT_ENTRY_SIZE)
 
 #define BULK_ACK_HEADER_SIZE 5
-#define MAX_MISSING_CHUNKS ((MAX_PACKET_LENGTH - BULK_ACK_HEADER_SIZE) / 4)
+#define MAX_MISSING_CHUNKS ((NET_IPC_MAX_DATA - BULK_ACK_HEADER_SIZE) / 4)
 
-// APIDs to poll/listen on
+// Payload-link body layout (our own convention on top of the opaque body
+// that payload_link/frame.h transports):
+//
+//   | APID (2B BE) | LEN (2B BE) | DATA (LEN bytes) | zero pad, if needed |
+//
+// LEN is the real byte count of DATA. Zero padding is appended only to meet
+// PL_MIN_BODY_LEN (payload_link enforces a 7-byte body floor) and MUST be
+// ignored by the receiver, which trusts LEN rather than the frame's own
+// decoded body length.
+#define LINK_BODY_HDR_SIZE 4
+#define LINK_BODY_MAX_DATA (PL_MAX_BODY_LEN - LINK_BODY_HDR_SIZE)
+
+_Static_assert(LINK_BODY_MAX_DATA >= NET_IPC_MAX_DATA,
+               "payload-link body can't fit a full-size packet");
+
+// Serial link parameters. Not specified anywhere else in this repo -
+// adjust to match the actual RS-422 transceiver/OBC configuration.
+#define SERIAL_BAUD B115200
+
+// APIDs to listen for from the OBC (i.e. legal on the bus->payload or
+// bidirectional direction, per PayloadApids).
 #define NUM_LISTEN_APIDS 6
-int listen_apids[NUM_LISTEN_APIDS] = {
-    APID_CMD_RX, 
-    APID_ADCS_TELEM_RX, 
-    APID_ADCS_RESP_RX, 
-    APID_BULK_EXP_RX, 
-    APID_BULK_CTRL_RX, 
-    APID_BULK_ACK_BIDI
+static const uint16_t listen_apids[NUM_LISTEN_APIDS] = {
+    STAR_APID_PAYLOAD_COMMAND,
+    STAR_APID_ADCS_TELEMETRY_PASSTHROUGH,
+    STAR_APID_ADCS_REQUEST_RESPONSE,
+    STAR_APID_EXPERIMENT_TABLE,
+    STAR_APID_CONTROL_ALGORITHM,
+    STAR_APID_BULK_DATA_RESPONSE,
 };
-
-// Apps to transmit data to OBC
-snp_app_t *app_telem_tx;
-snp_app_t *app_cmd_resp_tx;
-snp_app_t *app_adcs_req_tx;
-snp_app_t *app_bulk_calc_tx;
-snp_app_t *app_bulk_ft_tx;
-snp_app_t *app_bulk_vid_tx;
-snp_app_t *app_bulk_ack; // APID 0x035 is bidirectional
 
 // Connection to daemond. Payload application processes (e.g. payload_app)
 // exchange net_ipc_hdr_t-framed messages with us through this, keyed by the
 // app's registered name NET_IPC_PAYLOAD_APP_NAME.
 static daemon_client_t g_daemon;
+
+// The single RS-422 serial link to the OBC. Every APID shares this one fd;
+// payload-link frames carry the APID inside their body (see above), unlike
+// the old SPICEnet driver which gave each APID its own pipe/fd.
+static int g_serial_fd;
 
 // Forwards `len` bytes received on `apid` from the OBC to the payload
 // application process via the daemon. Fire-and-forget: if no app is
@@ -104,53 +104,110 @@ static void forward_to_app(uint16_t apid, const uint8_t *buf, int len) {
 // All multi-byte fields arrive in Big-Endian, handle this here also
 // APID 0x010
 void handle_payload_command(uint8_t *buf, int len) {
-    forward_to_app(APID_CMD_RX, buf, len);
+    forward_to_app(STAR_APID_PAYLOAD_COMMAND, buf, len);
 }
 
 // APID 0x020
 void handle_adcs_telemetry(uint8_t *buf, int len) {
-    forward_to_app(APID_ADCS_TELEM_RX, buf, len);
+    forward_to_app(STAR_APID_ADCS_TELEMETRY_PASSTHROUGH, buf, len);
 }
 
 // APID 0x022
 void handle_adcs_response(uint8_t *buf, int len) {
-    forward_to_app(APID_ADCS_RESP_RX, buf, len);
+    forward_to_app(STAR_APID_ADCS_REQUEST_RESPONSE, buf, len);
 }
 
 // APID 0x033
 void handle_bulk_experiment_table(uint8_t *buf, int len) {
-    forward_to_app(APID_BULK_EXP_RX, buf, len);
+    forward_to_app(STAR_APID_EXPERIMENT_TABLE, buf, len);
 }
 
 // APID 0x034
 void handle_bulk_control_algo(uint8_t *buf, int len) {
-    forward_to_app(APID_BULK_CTRL_RX, buf, len);
+    forward_to_app(STAR_APID_CONTROL_ALGORITHM, buf, len);
 }
 
 // APID 0x035
 void handle_bulk_ack(uint8_t *buf, int len) {
-    forward_to_app(APID_BULK_ACK_BIDI, buf, len);
+    forward_to_app(STAR_APID_BULK_DATA_RESPONSE, buf, len);
 }
 
-// Looks up which outbound SPICEnet app to write on for a given APID, for
-// routing net_ipc frames received from payload application processes back
-// out over the serial link.
-static snp_app_t *tx_app_for_apid(uint16_t apid) {
+static void dispatch_from_obc(uint16_t apid, uint8_t *buf, int len) {
     switch (apid) {
-        case APID_TELEM_TX:     return app_telem_tx;
-        case APID_CMD_RESP_TX:  return app_cmd_resp_tx;
-        case APID_ADCS_REQ_TX:  return app_adcs_req_tx;
-        case APID_BULK_CALC_TX: return app_bulk_calc_tx;
-        case APID_BULK_FT_TX:   return app_bulk_ft_tx;
-        case APID_BULK_VID_TX:  return app_bulk_vid_tx;
-        case APID_BULK_ACK_BIDI: return app_bulk_ack;
-        default: return NULL;
+        case STAR_APID_PAYLOAD_COMMAND:
+            handle_payload_command(buf, len);
+            break;
+        case STAR_APID_ADCS_TELEMETRY_PASSTHROUGH:
+            handle_adcs_telemetry(buf, len);
+            break;
+        case STAR_APID_ADCS_REQUEST_RESPONSE:
+            handle_adcs_response(buf, len);
+            break;
+        case STAR_APID_EXPERIMENT_TABLE:
+            handle_bulk_experiment_table(buf, len);
+            break;
+        case STAR_APID_CONTROL_ALGORITHM:
+            handle_bulk_control_algo(buf, len);
+            break;
+        case STAR_APID_BULK_DATA_RESPONSE:
+            handle_bulk_ack(buf, len);
+            break;
+        default:
+            fprintf(stderr, "[network] frame on unexpected apid 0x%03X\n", apid);
+            break;
     }
 }
 
+// Writes every byte in `buf` to `fd`, retrying on short writes/EINTR/EAGAIN.
+//TODO: MAKE THE WRITES NON BLOCKING
+static int write_all(int fd, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+// Packs `payload` into a payload-link body (APID + LEN + DATA, zero-padded
+// to the library's minimum body size if needed), frames it, and writes it
+// out over the serial link.
+static int link_send(uint16_t apid, const uint8_t *payload, uint16_t payload_len) {
+    if (payload_len > LINK_BODY_MAX_DATA) {
+        fprintf(stderr, "[network] payload too large for apid 0x%03X (%u bytes)\n", apid, payload_len);
+        return -1;
+    }
+
+    uint8_t body[LINK_BODY_HDR_SIZE + LINK_BODY_MAX_DATA];
+    size_t off = 0;
+    pack_be16(body, &off, apid);
+    pack_be16(body, &off, payload_len);
+    memcpy(body + off, payload, payload_len);
+    off += payload_len;
+    if (off < PL_MIN_BODY_LEN) {
+        memset(body + off, 0, PL_MIN_BODY_LEN - off);
+        off = PL_MIN_BODY_LEN;
+    }
+
+    uint8_t frame[PL_MAX_FRAME_LEN];
+    size_t frame_len = plframe_encode(body, off, frame);
+    if (frame_len == 0) {
+        fprintf(stderr, "[network] failed to frame apid 0x%03X\n", apid);
+        return -1;
+    }
+
+    return write_all(g_serial_fd, frame, frame_len);
+}
+
 // Handles one frame delivered by the daemon from a payload application
-// process: unwraps the net_ipc_hdr_t and writes the data out over
-// SPICEnet on the APID it names.
+// process: unwraps the net_ipc_hdr_t and sends the data out over the
+// serial link on the APID it names.
 static void handle_app_delivery(const uint8_t *buf, uint32_t len) {
     if (len < sizeof(net_ipc_hdr_t)) {
         fprintf(stderr, "[network] short net_ipc frame from app (%u bytes)\n", len);
@@ -164,42 +221,18 @@ static void handle_app_delivery(const uint8_t *buf, uint32_t len) {
         return;
     }
 
-    snp_app_t *app = tx_app_for_apid(hdr.apid);
-    if (app == NULL) {
+    if (!star_payload_apid_allowed_pay_to_bus(hdr.apid)) {
         fprintf(stderr, "[network] app requested send on unroutable apid 0x%03X\n", hdr.apid);
         return;
     }
 
-    int ret = snp_write(app, (void *)data, hdr.len);
+    int ret = link_send(hdr.apid, data, hdr.len);
     if (ret < 0) {
-        fprintf(stderr, "[network] snp_write failed for apid 0x%03X: %d\n", hdr.apid, ret);
+        fprintf(stderr, "[network] link_send failed for apid 0x%03X\n", hdr.apid);
     }
 }
 
 // Packing helpers
-static inline void pack_u8(uint8_t *buf, size_t *off, uint8_t val) {
-    buf[*off] = val;
-    *off += 1;
-}
-
-static inline void pack_be16(uint8_t *buf, size_t *off, uint16_t val) {
-    uint16_t be = htobe16(val);
-    memcpy(buf + *off, &be, sizeof(be));
-    *off += sizeof(be);
-}
-
-static inline void pack_be32(uint8_t *buf, size_t *off, uint32_t val) {
-    uint32_t be = htobe32(val);
-    memcpy(buf + *off, &be, sizeof(be));
-    *off += sizeof(be);
-}
-
-static inline void pack_be64(uint8_t *buf, size_t *off, uint64_t val) {
-    uint64_t be = htobe64(val);
-    memcpy(buf + *off, &be, sizeof(be));
-    *off += sizeof(be);
-}
-
 static inline void pack_be_float(uint8_t *buf, size_t *off, float val) {
     uint32_t bits;
     memcpy(&bits, &val, sizeof(bits));
@@ -242,8 +275,6 @@ static size_t pack_ft_entry(uint8_t *buf, const struct bulk_ft_entry *e) {
 }
 
 // Output handler functions
-// These are non blocking so they can snp_write can directly be called here
-
 //TODO: MAKE THE WRITES NON BLOCKING
 // APID 0x011
 int send_health_telemetry(uint64_t met, uint8_t state, uint8_t exp_id, float temp, uint32_t storage) {
@@ -256,8 +287,7 @@ int send_health_telemetry(uint64_t met, uint8_t state, uint8_t exp_id, float tem
     pack_be_float(buf, &off, temp);
     pack_be32(buf, &off, storage);
 
-    int ret = snp_write(app_telem_tx, buf, (int)off);
-    return ret < 0 ? ret : 0;
+    return link_send(STAR_APID_PAYLOAD_TELEMETRY, buf, (uint16_t)off);
 }
 
 // APID 0x012
@@ -268,8 +298,7 @@ int send_command_response(uint8_t opcode, uint8_t status) {
     pack_u8(buf, &off, opcode);
     pack_u8(buf, &off, status);
 
-    int ret = snp_write(app_cmd_resp_tx, buf, (int)off);
-    return ret < 0 ? ret : 0;
+    return link_send(STAR_APID_PAYLOAD_COMMAND_RESPONSE, buf, (uint16_t)off);
 }
 
 // APID 0x021
@@ -284,15 +313,14 @@ int send_adcs_request(uint8_t request_type, float target_quat[4], float target_r
         pack_be32(buf, &off, duration);
     }
 
-    int ret = snp_write(app_adcs_req_tx, buf, (int)off);
-    return ret < 0 ? ret : 0;
+    return link_send(STAR_APID_ADCS_POINTING_REQUEST, buf, (uint16_t)off);
 }
 
 // APID 0x030
 int send_bulk_calculation_data(uint32_t transfer_id, struct bulk_calc_entry *entries, uint32_t num_entries) {
     uint32_t total_chunks = (num_entries + MAX_CALC_ENTRIES_PER_CHUNK - 1) / MAX_CALC_ENTRIES_PER_CHUNK;
     uint8_t chunk_data[MAX_CALC_ENTRIES_PER_CHUNK * BULK_CALC_ENTRY_SIZE];
-    uint8_t frame[MAX_PACKET_LENGTH];
+    uint8_t packet[NET_IPC_MAX_DATA];
 
     for (uint32_t chunk = 0; chunk < total_chunks; chunk++) {
         uint32_t start = chunk * MAX_CALC_ENTRIES_PER_CHUNK;
@@ -304,8 +332,8 @@ int send_bulk_calculation_data(uint32_t transfer_id, struct bulk_calc_entry *ent
             data_off += pack_calc_entry(chunk_data + data_off, &entries[start + i]);
         }
 
-        int frame_len = pack_bulk_wrapper(frame, transfer_id, chunk, total_chunks, chunk_data, (uint16_t)data_off);
-        int ret = snp_write(app_bulk_calc_tx, frame, frame_len);
+        int packet_len = pack_bulk_wrapper(packet, transfer_id, chunk, total_chunks, chunk_data, (uint16_t)data_off);
+        int ret = link_send(STAR_APID_PAYLOAD_CALCULATION_DATA, packet, (uint16_t)packet_len);
         if (ret < 0) {
             return ret;
         }
@@ -318,7 +346,7 @@ int send_bulk_calculation_data(uint32_t transfer_id, struct bulk_calc_entry *ent
 int send_bulk_force_torque_data(uint32_t transfer_id, struct bulk_ft_entry *entries, uint32_t num_entries) {
     uint32_t total_chunks = (num_entries + MAX_FT_ENTRIES_PER_CHUNK - 1) / MAX_FT_ENTRIES_PER_CHUNK;
     uint8_t chunk_data[MAX_FT_ENTRIES_PER_CHUNK * BULK_FT_ENTRY_SIZE];
-    uint8_t frame[MAX_PACKET_LENGTH];
+    uint8_t packet[NET_IPC_MAX_DATA];
 
     for (uint32_t chunk = 0; chunk < total_chunks; chunk++) {
         uint32_t start = chunk * MAX_FT_ENTRIES_PER_CHUNK;
@@ -330,8 +358,8 @@ int send_bulk_force_torque_data(uint32_t transfer_id, struct bulk_ft_entry *entr
             data_off += pack_ft_entry(chunk_data + data_off, &entries[start + i]);
         }
 
-        int frame_len = pack_bulk_wrapper(frame, transfer_id, chunk, total_chunks, chunk_data, (uint16_t)data_off);
-        int ret = snp_write(app_bulk_ft_tx, frame, frame_len);
+        int packet_len = pack_bulk_wrapper(packet, transfer_id, chunk, total_chunks, chunk_data, (uint16_t)data_off);
+        int ret = link_send(STAR_APID_FORCE_TORQUE_SENSOR_DATA, packet, (uint16_t)packet_len);
         if (ret < 0) {
             return ret;
         }
@@ -343,15 +371,15 @@ int send_bulk_force_torque_data(uint32_t transfer_id, struct bulk_ft_entry *entr
 // APID 0x032
 int send_bulk_video_data(uint32_t transfer_id, uint8_t *video_buffer, uint32_t total_bytes) {
     uint32_t total_chunks = (total_bytes + MAX_CHUNK_DATA - 1) / MAX_CHUNK_DATA;
-    uint8_t frame[MAX_PACKET_LENGTH];
+    uint8_t packet[NET_IPC_MAX_DATA];
 
     for (uint32_t chunk = 0; chunk < total_chunks; chunk++) {
         uint32_t start = chunk * MAX_CHUNK_DATA;
         uint32_t remaining = total_bytes - start;
         uint16_t count = (uint16_t)(remaining < MAX_CHUNK_DATA ? remaining : MAX_CHUNK_DATA);
 
-        int frame_len = pack_bulk_wrapper(frame, transfer_id, chunk, total_chunks, video_buffer + start, count);
-        int ret = snp_write(app_bulk_vid_tx, frame, frame_len);
+        int packet_len = pack_bulk_wrapper(packet, transfer_id, chunk, total_chunks, video_buffer + start, count);
+        int ret = link_send(STAR_APID_IMAGE_VIDEO_DATA, packet, (uint16_t)packet_len);
         if (ret < 0) {
             return ret;
         }
@@ -362,7 +390,7 @@ int send_bulk_video_data(uint32_t transfer_id, uint8_t *video_buffer, uint32_t t
 
 // APID 0x035
 int send_bulk_ack(uint32_t transfer_id, uint8_t status, uint32_t *missing_chunks, uint32_t num_missing_chunks) {
-    uint8_t buf[MAX_PACKET_LENGTH];
+    uint8_t buf[NET_IPC_MAX_DATA];
     size_t off = 0;
 
     if (status == 0x00) {
@@ -377,8 +405,7 @@ int send_bulk_ack(uint32_t transfer_id, uint8_t status, uint32_t *missing_chunks
         pack_be32(buf, &off, missing_chunks[i]);
     }
 
-    int ret = snp_write(app_bulk_ack, buf, (int)off);
-    return ret < 0 ? ret : 0;
+    return link_send(STAR_APID_BULK_DATA_RESPONSE, buf, (uint16_t)off);
 }
 
 static void sleep_ms(int ms) {
@@ -386,10 +413,49 @@ static void sleep_ms(int ms) {
     nanosleep(&ts, NULL);
 }
 
+// Opens and configures the RS-422 serial link: 8N1, no flow control, raw
+// mode. poll()-driven, so the fd is left non-blocking.
+static int open_serial_port(const char *portname) {
+    int fd = open(portname, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct termios tty;
+    if (tcgetattr(fd, &tty) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    cfsetispeed(&tty, SERIAL_BAUD);
+    cfsetospeed(&tty, SERIAL_BAUD);
+
+    tty.c_cflag &= ~PARENB;
+    tty.c_cflag &= ~CSTOPB;
+    tty.c_cflag &= ~CSIZE;
+    tty.c_cflag |= CS8;
+    tty.c_cflag &= ~CRTSCTS;
+    tty.c_cflag |= CREAD | CLOCAL;
+
+    tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ECHONL | ISIG);
+    tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+    tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
+    tty.c_oflag &= ~(OPOST | ONLCR);
+
+    tty.c_cc[VTIME] = 0;
+    tty.c_cc[VMIN]  = 0;
+
+    if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
 int main(int argc, char **argv) {
-    int fd;
     const char *portname = argc > 1 ? argv[1] : "/dev/ttyS0";
-    uint8_t rx_buffer[512]; // Max payload MTU 512 bytes
+    uint8_t rx_buffer[256]; // raw bytes read per poll() wakeup
 
     // Connected before touching the serial link so the daemon side of this
     // bridge (payload app traffic) doesn't depend on RS-422 hardware being
@@ -417,76 +483,32 @@ int main(int argc, char **argv) {
                boot_state.op_state, boot_state.active_experiment_id, boot_state.dce_authority_held);
     }
 
-    if (snp_open(&fd, (char *)portname) != 0) {
+    g_serial_fd = open_serial_port(portname);
+    if (g_serial_fd < 0) {
         perror("[Failed to open serial connection]");
         return EXIT_FAILURE;
     }
     printf("[Opened Serial Connection] %s\n", portname);
 
-    if (snp_listen(fd) != 0) {
-        printf("[Serial Connection Invalid]\n");
-        return EXIT_FAILURE;
-    }
-    printf("[Serial Connection Confirmed]\n");
+    plframe_decode_ctx_t decoder;
+    plframe_decode_init(&decoder);
 
-    // Connect to all listening APIDs, plus one extra pollfd for the daemon
-    // connection (payload app traffic).
-    snp_app_t *apps[NUM_LISTEN_APIDS];
-    struct pollfd pollfds[NUM_LISTEN_APIDS + 1];
-    const int daemon_pfd_idx = NUM_LISTEN_APIDS;
+    // Poll on the serial link plus the daemon connection (payload app
+    // traffic). Unlike the old SPICEnet driver, there's only one serial fd
+    // for every APID - decoded frames are dispatched by the APID embedded
+    // in their body (see dispatch_from_obc).
+    struct pollfd pollfds[2];
+    const int serial_pfd_idx = 0;
+    const int daemon_pfd_idx = 1;
 
-    for (int i = 0; i < NUM_LISTEN_APIDS; i++) {
-        if (snp_connect(listen_apids[i], &apps[i]) != 0) {
-            fprintf(stderr, "[Failed to connect to apid 0x%03X]\n", listen_apids[i]);
-            return EXIT_FAILURE;
-        }
-
-        printf("[Connected to apid] 0x%03X\n", listen_apids[i]);
-        pollfds[i].fd = apps[i]->read[0];
-        pollfds[i].events = POLLIN;
-
-        if (listen_apids[i] == APID_BULK_ACK_BIDI) {
-            app_bulk_ack = apps[i];
-        }
-    }
-
-    // Connect to all transmitting APIDs
-    if (snp_connect(APID_TELEM_TX, &app_telem_tx) != 0) {
-        fprintf(stderr, "[Failed to connect to apid 0x%03X]\n", APID_TELEM_TX);
-        return EXIT_FAILURE;
-    }
-
-    if (snp_connect(APID_CMD_RESP_TX, &app_cmd_resp_tx) != 0) {
-        fprintf(stderr, "[Failed to connect to apid 0x%03X]\n", APID_CMD_RESP_TX);
-        return EXIT_FAILURE;
-    }
-
-    if (snp_connect(APID_ADCS_REQ_TX, &app_adcs_req_tx) != 0) {
-        fprintf(stderr, "[Failed to connect to apid 0x%03X]\n", APID_ADCS_REQ_TX);
-        return EXIT_FAILURE;
-    }
-
-    if (snp_connect(APID_BULK_CALC_TX, &app_bulk_calc_tx) != 0) {
-        fprintf(stderr, "[Failed to connect to apid 0x%03X]\n", APID_BULK_CALC_TX);
-        return EXIT_FAILURE;
-    }
-
-    if (snp_connect(APID_BULK_FT_TX, &app_bulk_ft_tx) != 0) {
-        fprintf(stderr, "[Failed to connect to apid 0x%03X]\n", APID_BULK_FT_TX);
-        return EXIT_FAILURE;
-    }
-
-    if (snp_connect(APID_BULK_VID_TX, &app_bulk_vid_tx) != 0) {
-        fprintf(stderr, "[Failed to connect to apid 0x%03X]\n", APID_BULK_VID_TX);
-        return EXIT_FAILURE;
-    }
-
+    pollfds[serial_pfd_idx].fd     = g_serial_fd;
+    pollfds[serial_pfd_idx].events = POLLIN;
     pollfds[daemon_pfd_idx].fd     = daemon_client_fd(&g_daemon);
     pollfds[daemon_pfd_idx].events = POLLIN;
 
     // Event Loop
     while (1) {
-        int ret = poll(pollfds, NUM_LISTEN_APIDS + 1, -1);
+        int ret = poll(pollfds, 2, -1);
 
         if (ret > 0) {
             if (pollfds[daemon_pfd_idx].revents & POLLIN) {
@@ -503,35 +525,40 @@ int main(int argc, char **argv) {
                 }
             }
 
-            for (int i = 0; i < NUM_LISTEN_APIDS; i++) {
-                if (pollfds[i].revents & POLLIN) {
-                    
-                    int bytes_read = snp_read(apps[i], rx_buffer, sizeof(rx_buffer));
-                    
-                    if (bytes_read > 0) {
-                        // Route to appropriate handler based on APID
-                        switch(apps[i]->apid) {
-                            case APID_CMD_RX:
-                                handle_payload_command(rx_buffer, bytes_read);
+            if (pollfds[serial_pfd_idx].revents & POLLIN) {
+                int bytes_read = (int)read(g_serial_fd, rx_buffer, sizeof(rx_buffer));
+
+                for (int i = 0; i < bytes_read; i++) {
+                    plframe_decode_result_t result = plframe_decode_feed(&decoder, rx_buffer[i]);
+
+                    switch (result) {
+                        case PL_DECODE_NEED_MORE:
+                            break;
+
+                        case PL_DECODE_OK: {
+                            size_t off = 0;
+                            if (decoder.body_len < LINK_BODY_HDR_SIZE) {
+                                fprintf(stderr, "[network] runt payload-link body (%u bytes)\n", decoder.body_len);
                                 break;
-                            case APID_ADCS_TELEM_RX:
-                                handle_adcs_telemetry(rx_buffer, bytes_read);
+                            }
+                            uint16_t apid = unpack_be16(decoder.body, &off);
+                            uint16_t data_len = unpack_be16(decoder.body, &off);
+                            if ((size_t)off + data_len > decoder.body_len) {
+                                fprintf(stderr, "[network] apid 0x%03X claims %u bytes, only %u in body\n",
+                                        apid, data_len, decoder.body_len);
                                 break;
-                            case APID_ADCS_RESP_RX:
-                                handle_adcs_response(rx_buffer, bytes_read);
-                                break;
-                            case APID_BULK_EXP_RX:
-                                handle_bulk_experiment_table(rx_buffer, bytes_read);
-                                break;
-                            case APID_BULK_CTRL_RX:
-                                handle_bulk_control_algo(rx_buffer, bytes_read);
-                                break;
-                            case APID_BULK_ACK_BIDI:
-                                handle_bulk_ack(rx_buffer, bytes_read);
-                                break;
-                            default:
-                                break;
+                            }
+                            dispatch_from_obc(apid, decoder.body + off, data_len);
+                            break;
                         }
+
+                        case PL_DECODE_BAD_CRC:
+                            fprintf(stderr, "[network] dropped payload-link frame with bad CRC\n");
+                            break;
+
+                        case PL_DECODE_RESYNC:
+                            fprintf(stderr, "[network] payload-link decoder resynced\n");
+                            break;
                     }
                 }
             }
