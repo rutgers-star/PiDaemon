@@ -1,0 +1,6 @@
+[submodule "PayloadLink"]
+	path = PayloadLink
+	url = https://github.com/ja-zoe/payload-link.git
+[submodule "PayloadApids"]
+	path = PayloadApids
+	url = https://github.com/rutgers-star/payload-apids.git
