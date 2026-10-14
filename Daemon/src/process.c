@@ -147,6 +147,11 @@ int pm_reap(process_manager_t *pm) {
         int should_restart = mp->spec.restart == RESTART_ALWAYS ||
                               (mp->spec.restart == RESTART_ON_FAILURE && failed);
         if (!should_restart) {
+            // RESTART_NEVER, or RESTART_ON_FAILURE with a clean exit: stay
+            // stopped. Without this, pm_tick's restart check (pid == 0 &&
+            // !given_up) can't tell "doesn't want to restart" from "hasn't
+            // restarted yet" and would relaunch it on the next tick anyway.
+            mp->given_up = 1;
             continue;
         }
 

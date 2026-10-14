@@ -46,3 +46,14 @@ target_link_libraries(payload_app PRIVATE daemonclient)
 target_include_directories(payload_app PRIVATE ${PROJECT_SOURCE_DIR}/../Network/include)
 target_compile_options(payload_app PRIVATE ${COMPILER_FLAGS})
 target_link_options(payload_app PRIVATE ${COMPILER_FLAGS})
+
+# Test utility: uploads a real file to the OBC as a bulk Image/Video Data
+# Transfer (APID 0x032) through the real "network" bridge - see the header
+# comment in src/video_uploader.c.
+add_executable(video_uploader
+    ${PROJECT_SOURCE_DIR}/src/video_uploader.c
+)
+target_link_libraries(video_uploader PRIVATE daemonclient)
+target_include_directories(video_uploader PRIVATE ${PROJECT_SOURCE_DIR}/../Network/include)
+target_compile_options(video_uploader PRIVATE ${COMPILER_FLAGS})
+target_link_options(video_uploader PRIVATE ${COMPILER_FLAGS})

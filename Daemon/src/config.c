@@ -16,3 +16,8 @@ const char *daemon_pid_path(void) {
     const char *env = getenv("PIOBC_PID_PATH");
     return env != NULL ? env : DAEMON_PID_PATH_DEFAULT;
 }
+
+const char *daemon_video_upload_path(void) {
+    const char *env = getenv("PIOBC_VIDEO_UPLOAD_PATH");
+    return env != NULL ? env : DAEMON_VIDEO_UPLOAD_PATH_DEFAULT;
+}

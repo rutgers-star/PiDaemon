@@ -139,6 +139,32 @@ static void register_payload_app(process_manager_t *pm, const char *bin_dir) {
     pm_add(pm, &payload_app);
 }
 
+// Test probe: ships whatever file sits at daemon_video_upload_path() to the
+// OBC as a bulk Image/Video Data Transfer on startup (see
+// Daemon/src/video_uploader.c). Only registered when that file actually
+// exists, so a normal flight boot with nothing dropped there doesn't spawn a
+// process that would just fail to open its input and exit. One-shot by
+// design (RESTART_NEVER) - it's a single simulated upload, not a service.
+static void register_video_uploader(process_manager_t *pm, const char *bin_dir) {
+    static process_spec_t video_uploader;
+    const char *video_path = daemon_video_upload_path();
+
+    struct stat st;
+    if (stat(video_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "[Daemon] no video file at %s, not registering video_uploader\n", video_path);
+        return;
+    }
+
+    memset(&video_uploader, 0, sizeof(video_uploader));
+    snprintf(video_uploader.name, sizeof(video_uploader.name), "video_uploader");
+    snprintf(video_uploader.path, sizeof(video_uploader.path), "%s/video_uploader", bin_dir);
+    video_uploader.argv[1] = (char *)video_path;
+    video_uploader.argv[2] = "video_uploader";
+    video_uploader.argv[3] = NULL;
+    video_uploader.restart = RESTART_NEVER;
+    pm_add(pm, &video_uploader);
+}
+
 #ifndef NETWORK_BIN_PATH
 #define NETWORK_BIN_PATH NULL
 #endif
@@ -201,6 +227,7 @@ int main(void) {
     }
     register_payload_app(&pm, bin_dir);
     register_network(&pm);
+    register_video_uploader(&pm, bin_dir);
     pm_start_all(&pm);
 
     ipc_server_t *srv = ipc_server_create(daemon_socket_path());
