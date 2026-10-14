@@ -30,6 +30,7 @@ int pm_add(process_manager_t *pm, const process_spec_t *spec) {
 }
 
 static int start_one(managed_process_t *mp) {
+    printf("[ProcMgr] starting '%s\n", mp->spec.name);
     pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, "[ProcMgr] fork failed for '%s': %s\n", mp->spec.name, strerror(errno));
