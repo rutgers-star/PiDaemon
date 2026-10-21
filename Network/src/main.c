@@ -19,33 +19,11 @@
 #include <daemon/proto.h>
 #include <net_ipc.h>
 
-// Entries for bulk transfer
-struct bulk_calc_entry {
-    uint64_t mission_time;
-    float    angular_accel[3];
-    float    commanded_torque[4];
-};
-
-struct bulk_ft_entry {
-    uint64_t mission_time;
-    float    force_vector[3];
-    float    torque_vector[3];
-};
-
 // Bulk Data Transfer Wrapper layout constants (application-level, carried as
 // the payload of a STAR_APID_* bulk-transfer message inside a payload-link
 // frame body - see pack_bulk_wrapper()).
 #define BULK_WRAPPER_HEADER_SIZE 14
 #define MAX_CHUNK_DATA (NET_IPC_MAX_DATA - BULK_WRAPPER_HEADER_SIZE)
-
-#define BULK_CALC_ENTRY_SIZE 36
-#define MAX_CALC_ENTRIES_PER_CHUNK (MAX_CHUNK_DATA / BULK_CALC_ENTRY_SIZE)
-
-#define BULK_FT_ENTRY_SIZE 32
-#define MAX_FT_ENTRIES_PER_CHUNK (MAX_CHUNK_DATA / BULK_FT_ENTRY_SIZE)
-
-#define BULK_ACK_HEADER_SIZE 5
-#define MAX_MISSING_CHUNKS ((NET_IPC_MAX_DATA - BULK_ACK_HEADER_SIZE) / 4)
 
 // Payload-link body layout (our own convention on top of the opaque body
 // that payload_link/frame.h transports):
@@ -158,30 +136,114 @@ static void dispatch_from_obc(uint16_t apid, uint8_t *buf, int len) {
     }
 }
 
-// Writes every byte in `buf` to `fd`, retrying on short writes/EINTR/EAGAIN.
-//TODO: MAKE THE WRITES NON BLOCKING
-static int write_all(int fd, const uint8_t *buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = write(fd, buf + off, len - off);
-        if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;
-            }
-            return -1;
-        }
-        off += (size_t)n;
+// ---- outbound send scheduling ----
+//
+// Every frame bound for the OBC is encoded once and enqueued onto one of
+// two priority bands instead of being written immediately:
+//
+//   NORMAL - telemetry, command responses, ADCS requests, bulk acks. Small
+//            and latency sensitive: the ICD's 1 Hz minimum heartbeat (and
+//            obc_daemon's missed-heartbeat watchdog) depend on these not
+//            queuing up behind a bulk transfer.
+//   BULK   - calculation/force-torque/video chunks. Fine to wait for
+//            whatever bandwidth NORMAL traffic isn't using.
+//
+// service_outbound() sends at most one frame's worth of progress per call:
+// NORMAL is always drained first, so a multi-minute bulk transfer can never
+// delay NORMAL traffic queued behind it by more than a single frame's write
+// time. The main loop calls it every iteration, which is also what gives a
+// long transfer a chance to proceed without ever blocking the loop on a
+// slow serial write.
+typedef struct {
+    uint8_t data[PL_MAX_FRAME_LEN];
+    size_t  len;
+} tx_frame_t;
+
+#define TX_QUEUE_CAP 64
+
+typedef struct {
+    tx_frame_t frames[TX_QUEUE_CAP];
+    int        head;
+    int        count;
+} tx_queue_t;
+
+static tx_queue_t g_normal_tx;
+static tx_queue_t g_bulk_tx;
+
+static int tx_queue_push(tx_queue_t *q, const uint8_t *data, size_t len) {
+    if (q->count >= TX_QUEUE_CAP) {
+        return -1;
     }
+    int slot = (q->head + q->count) % TX_QUEUE_CAP;
+    memcpy(q->frames[slot].data, data, len);
+    q->frames[slot].len = len;
+    q->count++;
     return 0;
 }
 
-// Packs `payload` into a payload-link body (APID + LEN + DATA, zero-padded
-// to the library's minimum body size if needed), frames it, and writes it
-// out over the serial link.
-static int link_send(uint16_t apid, const uint8_t *payload, uint16_t payload_len) {
+static int tx_queue_pop(tx_queue_t *q, uint8_t *out, size_t *out_len) {
+    if (q->count == 0) {
+        return -1;
+    }
+    memcpy(out, q->frames[q->head].data, q->frames[q->head].len);
+    *out_len = q->frames[q->head].len;
+    q->head = (q->head + 1) % TX_QUEUE_CAP;
+    q->count--;
+    return 0;
+}
+
+// The frame currently being written to the serial fd, possibly across
+// multiple non-blocking write()s / poll() wakeups.
+static uint8_t g_inflight_frame[PL_MAX_FRAME_LEN];
+static size_t  g_inflight_len;
+static size_t  g_inflight_sent;
+static int     g_inflight_active;
+
+// File-based outbound bulk transfer (NET_IPC_CTRL_BULK_UPLOAD) in progress,
+// if any. Chunks are read and sent one at a time from service_outbound(),
+// not all at once, so a large file can't monopolize the event loop - see
+// generate_video_chunk(). Only one at a time: a new request simply
+// supersedes whatever was in progress, same as the dummy bulk sessions
+// Daemon/src/payload_app.c tracks for inbound transfers.
+typedef struct {
+    int      active;
+    FILE    *f;
+    uint32_t transfer_id;
+    uint32_t total_bytes;
+    uint32_t total_chunks;
+    uint32_t next_chunk;
+} file_bulk_tx_t;
+
+static file_bulk_tx_t g_video_tx;
+
+static void abort_video_tx(void) {
+    if (g_video_tx.f != NULL) {
+        fclose(g_video_tx.f);
+    }
+    memset(&g_video_tx, 0, sizeof(g_video_tx));
+}
+
+// Packs the common Bulk Data Transfer Wrapper header + data, returns total
+// wrapper length.
+static size_t pack_bulk_wrapper(uint8_t *frame, uint32_t transfer_id, uint32_t chunk_seq, uint32_t total_chunks,
+                                 const uint8_t *data, uint16_t n) {
+    size_t off = 0;
+    pack_be32(frame, &off, transfer_id);
+    pack_be32(frame, &off, chunk_seq);
+    pack_be32(frame, &off, total_chunks);
+    pack_be16(frame, &off, n);
+    memcpy(frame + off, data, n);
+    off += n;
+    return off;
+}
+
+// Encodes `payload` (one APID's User Data Field) as a full payload-link
+// frame (body header + zero-padding + sync/length/CRC framing) into
+// `frame_out`. Returns the frame length, or 0 on failure (logged here).
+static size_t encode_link_frame(uint16_t apid, const uint8_t *payload, uint16_t payload_len, uint8_t *frame_out) {
     if (payload_len > LINK_BODY_MAX_DATA) {
         fprintf(stderr, "[network] payload too large for apid 0x%03X (%u bytes)\n", apid, payload_len);
-        return -1;
+        return 0;
     }
 
     uint8_t body[LINK_BODY_HDR_SIZE + LINK_BODY_MAX_DATA];
@@ -195,19 +257,190 @@ static int link_send(uint16_t apid, const uint8_t *payload, uint16_t payload_len
         off = PL_MIN_BODY_LEN;
     }
 
-    uint8_t frame[PL_MAX_FRAME_LEN];
-    size_t frame_len = plframe_encode(body, off, frame);
+    size_t frame_len = plframe_encode(body, off, frame_out);
     if (frame_len == 0) {
         fprintf(stderr, "[network] failed to frame apid 0x%03X\n", apid);
+    }
+    return frame_len;
+}
+
+static int apid_is_bulk(uint16_t apid) {
+    return apid == STAR_APID_PAYLOAD_CALCULATION_DATA || apid == STAR_APID_FORCE_TORQUE_SENSOR_DATA ||
+           apid == STAR_APID_IMAGE_VIDEO_DATA;
+}
+
+// Encodes and enqueues one frame onto the priority band matching its APID.
+// Used for every outbound send except the active file transfer's chunks,
+// which are generated directly into the in-flight slot by
+// generate_video_chunk() instead of round-tripping through the BULK queue.
+static int enqueue_send(uint16_t apid, const uint8_t *payload, uint16_t payload_len) {
+    uint8_t frame[PL_MAX_FRAME_LEN];
+    size_t  frame_len = encode_link_frame(apid, payload, payload_len, frame);
+    if (frame_len == 0) {
         return -1;
     }
 
-    return write_all(g_serial_fd, frame, frame_len);
+    tx_queue_t *q = apid_is_bulk(apid) ? &g_bulk_tx : &g_normal_tx;
+    if (tx_queue_push(q, frame, frame_len) != 0) {
+        fprintf(stderr, "[network] tx queue full, dropping apid 0x%03X frame\n", apid);
+        return -1;
+    }
+    return 0;
+}
+
+// Starts (or begins restarting, from offset 0) an outbound file transfer
+// requested via NET_IPC_CTRL_BULK_UPLOAD. "network" owns reading the file
+// from here on - the sender only told us where it is.
+static void handle_bulk_upload(const uint8_t *data, uint16_t len) {
+    if (len < sizeof(net_ipc_bulk_upload_t)) {
+        fprintf(stderr, "[network] short bulk upload request (%u bytes)\n", len);
+        return;
+    }
+    net_ipc_bulk_upload_t req;
+    memcpy(&req, data, sizeof(req));
+    req.file_path[sizeof(req.file_path) - 1] = '\0';
+
+    if (g_video_tx.active) {
+        fprintf(stderr, "[network] bulk upload %u superseded by transfer %u\n", g_video_tx.transfer_id,
+                req.transfer_id);
+        abort_video_tx();
+    }
+
+    FILE *f = fopen(req.file_path, "rb");
+    if (f == NULL) {
+        fprintf(stderr, "[network] bulk upload %u: failed to open %s: %s\n", req.transfer_id, req.file_path,
+                strerror(errno));
+        return;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || ftell(f) < 0) {
+        fprintf(stderr, "[network] bulk upload %u: failed to size %s: %s\n", req.transfer_id, req.file_path,
+                strerror(errno));
+        fclose(f);
+        return;
+    }
+    long size = ftell(f);
+    rewind(f);
+
+    uint32_t total_chunks = ((uint32_t)size + MAX_CHUNK_DATA - 1) / MAX_CHUNK_DATA;
+    if (total_chunks == 0) {
+        total_chunks = 1; // still send one (empty) chunk so the OBC sees the session
+    }
+
+    g_video_tx.active       = 1;
+    g_video_tx.f             = f;
+    g_video_tx.transfer_id   = req.transfer_id;
+    g_video_tx.total_bytes   = (uint32_t)size;
+    g_video_tx.total_chunks  = total_chunks;
+    g_video_tx.next_chunk    = 0;
+    fprintf(stderr, "[network] bulk upload %u started: %s (%u bytes, %u chunks)\n", req.transfer_id, req.file_path,
+            (uint32_t)size, total_chunks);
+}
+
+// Reads and encodes exactly one chunk of the active file transfer into
+// `frame_out`, advancing (and, on the last chunk, closing) g_video_tx.
+// Returns the encoded frame length, or 0 if nothing was produced (read
+// failure, already logged here).
+static size_t generate_video_chunk(uint8_t *frame_out) {
+    uint32_t chunk     = g_video_tx.next_chunk;
+    uint32_t start      = chunk * MAX_CHUNK_DATA;
+    uint32_t remaining  = g_video_tx.total_bytes - start;
+    uint16_t n          = (uint16_t)(remaining < MAX_CHUNK_DATA ? remaining : MAX_CHUNK_DATA);
+
+    uint8_t chunk_data[MAX_CHUNK_DATA];
+    if (n > 0 && fread(chunk_data, 1, n, g_video_tx.f) != n) {
+        fprintf(stderr, "[network] bulk upload %u: read failed at chunk %u: %s\n", g_video_tx.transfer_id, chunk,
+                strerror(errno));
+        abort_video_tx();
+        return 0;
+    }
+
+    uint8_t wrapper[BULK_WRAPPER_HEADER_SIZE + MAX_CHUNK_DATA];
+    size_t  wlen = pack_bulk_wrapper(wrapper, g_video_tx.transfer_id, chunk, g_video_tx.total_chunks, chunk_data, n);
+
+    size_t frame_len = encode_link_frame(STAR_APID_IMAGE_VIDEO_DATA, wrapper, (uint16_t)wlen, frame_out);
+
+    g_video_tx.next_chunk++;
+    if (g_video_tx.next_chunk >= g_video_tx.total_chunks) {
+        fprintf(stderr, "[network] bulk upload %u complete: %u bytes in %u chunks\n", g_video_tx.transfer_id,
+                g_video_tx.total_bytes, g_video_tx.total_chunks);
+        abort_video_tx();
+    }
+    return frame_len;
+}
+
+static void start_inflight(const uint8_t *frame, size_t len) {
+    memcpy(g_inflight_frame, frame, len);
+    g_inflight_len    = len;
+    g_inflight_sent    = 0;
+    g_inflight_active = 1;
+}
+
+// Writes as much of the in-flight frame as the serial fd will currently
+// accept. g_serial_fd is non-blocking: a short/zero write just means the
+// fd's output buffer is full right now, so the remainder stays queued and
+// g_inflight_active stays set for the next poll() wakeup (with POLLOUT
+// registered) to continue from - never busy-spins waiting for room.
+static void try_write_inflight(void) {
+    while (g_inflight_sent < g_inflight_len) {
+        ssize_t n = write(g_serial_fd, g_inflight_frame + g_inflight_sent, g_inflight_len - g_inflight_sent);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return; // still active; resume on next POLLOUT
+            }
+            fprintf(stderr, "[network] serial write failed: %s\n", strerror(errno));
+            g_inflight_active = 0; // drop the frame rather than retry a broken fd forever
+            return;
+        }
+        g_inflight_sent += (size_t)n;
+    }
+    g_inflight_active = 0; // fully sent
+}
+
+// Makes one unit of outbound progress: finishes whatever frame is already
+// in flight, or starts the next one (NORMAL band, then BULK band, then one
+// freshly-read chunk of the active file transfer, in that priority order).
+// Called every main-loop iteration regardless of why poll() returned, so a
+// long bulk transfer makes steady progress without ever blocking the loop.
+static void service_outbound(void) {
+    if (g_inflight_active) {
+        try_write_inflight();
+        return;
+    }
+
+    uint8_t frame[PL_MAX_FRAME_LEN];
+    size_t  len;
+
+    if (tx_queue_pop(&g_normal_tx, frame, &len) == 0) {
+        start_inflight(frame, len);
+        try_write_inflight();
+        return;
+    }
+    if (tx_queue_pop(&g_bulk_tx, frame, &len) == 0) {
+        start_inflight(frame, len);
+        try_write_inflight();
+        return;
+    }
+    if (g_video_tx.active) {
+        len = generate_video_chunk(frame);
+        if (len > 0) {
+            start_inflight(frame, len);
+            try_write_inflight();
+        }
+        return;
+    }
+}
+
+static int outbound_work_pending(void) {
+    return g_inflight_active || g_normal_tx.count > 0 || g_bulk_tx.count > 0 || g_video_tx.active;
 }
 
 // Handles one frame delivered by the daemon from a payload application
-// process: unwraps the net_ipc_hdr_t and sends the data out over the
-// serial link on the APID it names.
+// process. NET_IPC_CTRL_BULK_UPLOAD starts a file transfer (see above);
+// anything else unwraps the net_ipc_hdr_t as-is and enqueues it for sending
+// out over the serial link on the APID it names.
 static void handle_app_delivery(const uint8_t *buf, uint32_t len) {
     if (len < sizeof(net_ipc_hdr_t)) {
         fprintf(stderr, "[network] short net_ipc frame from app (%u bytes)\n", len);
@@ -221,191 +454,19 @@ static void handle_app_delivery(const uint8_t *buf, uint32_t len) {
         return;
     }
 
+    if (hdr.apid == NET_IPC_CTRL_BULK_UPLOAD) {
+        handle_bulk_upload(data, hdr.len);
+        return;
+    }
+
     if (!star_payload_apid_allowed_pay_to_bus(hdr.apid)) {
         fprintf(stderr, "[network] app requested send on unroutable apid 0x%03X\n", hdr.apid);
         return;
     }
 
-    int ret = link_send(hdr.apid, data, hdr.len);
-    if (ret < 0) {
-        fprintf(stderr, "[network] link_send failed for apid 0x%03X\n", hdr.apid);
+    if (enqueue_send(hdr.apid, data, hdr.len) < 0) {
+        fprintf(stderr, "[network] failed to enqueue apid 0x%03X\n", hdr.apid);
     }
-}
-
-// Packing helpers
-static inline void pack_be_float(uint8_t *buf, size_t *off, float val) {
-    uint32_t bits;
-    memcpy(&bits, &val, sizeof(bits));
-    pack_be32(buf, off, bits);
-}
-
-static inline void pack_be_float_array(uint8_t *buf, size_t *off, const float *vals, int n) {
-    for (int i = 0; i < n; i++) {
-        pack_be_float(buf, off, vals[i]);
-    }
-}
-
-// Packs the common Bulk Data Transfer Wrapper header + data returns total frame length
-static int pack_bulk_wrapper(uint8_t *frame, uint32_t transfer_id, uint32_t chunk_seq, uint32_t total_chunks,
-                              const uint8_t *data, uint16_t n) {
-    size_t off = 0;
-    pack_be32(frame, &off, transfer_id);
-    pack_be32(frame, &off, chunk_seq);
-    pack_be32(frame, &off, total_chunks);
-    pack_be16(frame, &off, n);
-    memcpy(frame + off, data, n);
-    off += n;
-    return (int)off;
-}
-
-static size_t pack_calc_entry(uint8_t *buf, const struct bulk_calc_entry *e) {
-    size_t off = 0;
-    pack_be64(buf, &off, e->mission_time);
-    pack_be_float_array(buf, &off, e->angular_accel, 3);
-    pack_be_float_array(buf, &off, e->commanded_torque, 4);
-    return off;
-}
-
-static size_t pack_ft_entry(uint8_t *buf, const struct bulk_ft_entry *e) {
-    size_t off = 0;
-    pack_be64(buf, &off, e->mission_time);
-    pack_be_float_array(buf, &off, e->force_vector, 3);
-    pack_be_float_array(buf, &off, e->torque_vector, 3);
-    return off;
-}
-
-// Output handler functions
-//TODO: MAKE THE WRITES NON BLOCKING
-// APID 0x011
-int send_health_telemetry(uint64_t met, uint8_t state, uint8_t exp_id, float temp, uint32_t storage) {
-    uint8_t buf[8 + 1 + 1 + 4 + 4];
-    size_t off = 0;
-
-    pack_be64(buf, &off, met);
-    pack_u8(buf, &off, state);
-    pack_u8(buf, &off, exp_id);
-    pack_be_float(buf, &off, temp);
-    pack_be32(buf, &off, storage);
-
-    return link_send(STAR_APID_PAYLOAD_TELEMETRY, buf, (uint16_t)off);
-}
-
-// APID 0x012
-int send_command_response(uint8_t opcode, uint8_t status) {
-    uint8_t buf[2];
-    size_t off = 0;
-
-    pack_u8(buf, &off, opcode);
-    pack_u8(buf, &off, status);
-
-    return link_send(STAR_APID_PAYLOAD_COMMAND_RESPONSE, buf, (uint16_t)off);
-}
-
-// APID 0x021
-int send_adcs_request(uint8_t request_type, float target_quat[4], float target_rates[3], uint32_t duration) {
-    uint8_t buf[1 + 16 + 12 + 4];
-    size_t off = 0;
-
-    pack_u8(buf, &off, request_type);
-    if(request_type != 0xA1 && request_type != 0xA0) {
-        pack_be_float_array(buf, &off, target_quat, 4);
-        pack_be_float_array(buf, &off, target_rates, 3);
-        pack_be32(buf, &off, duration);
-    }
-
-    return link_send(STAR_APID_ADCS_POINTING_REQUEST, buf, (uint16_t)off);
-}
-
-// APID 0x030
-int send_bulk_calculation_data(uint32_t transfer_id, struct bulk_calc_entry *entries, uint32_t num_entries) {
-    uint32_t total_chunks = (num_entries + MAX_CALC_ENTRIES_PER_CHUNK - 1) / MAX_CALC_ENTRIES_PER_CHUNK;
-    uint8_t chunk_data[MAX_CALC_ENTRIES_PER_CHUNK * BULK_CALC_ENTRY_SIZE];
-    uint8_t packet[NET_IPC_MAX_DATA];
-
-    for (uint32_t chunk = 0; chunk < total_chunks; chunk++) {
-        uint32_t start = chunk * MAX_CALC_ENTRIES_PER_CHUNK;
-        uint32_t remaining = num_entries - start;
-        uint32_t count = remaining < MAX_CALC_ENTRIES_PER_CHUNK ? remaining : MAX_CALC_ENTRIES_PER_CHUNK;
-
-        size_t data_off = 0;
-        for (uint32_t i = 0; i < count; i++) {
-            data_off += pack_calc_entry(chunk_data + data_off, &entries[start + i]);
-        }
-
-        int packet_len = pack_bulk_wrapper(packet, transfer_id, chunk, total_chunks, chunk_data, (uint16_t)data_off);
-        int ret = link_send(STAR_APID_PAYLOAD_CALCULATION_DATA, packet, (uint16_t)packet_len);
-        if (ret < 0) {
-            return ret;
-        }
-    }
-
-    return 0;
-}
-
-// APID 0x031
-int send_bulk_force_torque_data(uint32_t transfer_id, struct bulk_ft_entry *entries, uint32_t num_entries) {
-    uint32_t total_chunks = (num_entries + MAX_FT_ENTRIES_PER_CHUNK - 1) / MAX_FT_ENTRIES_PER_CHUNK;
-    uint8_t chunk_data[MAX_FT_ENTRIES_PER_CHUNK * BULK_FT_ENTRY_SIZE];
-    uint8_t packet[NET_IPC_MAX_DATA];
-
-    for (uint32_t chunk = 0; chunk < total_chunks; chunk++) {
-        uint32_t start = chunk * MAX_FT_ENTRIES_PER_CHUNK;
-        uint32_t remaining = num_entries - start;
-        uint32_t count = remaining < MAX_FT_ENTRIES_PER_CHUNK ? remaining : MAX_FT_ENTRIES_PER_CHUNK;
-
-        size_t data_off = 0;
-        for (uint32_t i = 0; i < count; i++) {
-            data_off += pack_ft_entry(chunk_data + data_off, &entries[start + i]);
-        }
-
-        int packet_len = pack_bulk_wrapper(packet, transfer_id, chunk, total_chunks, chunk_data, (uint16_t)data_off);
-        int ret = link_send(STAR_APID_FORCE_TORQUE_SENSOR_DATA, packet, (uint16_t)packet_len);
-        if (ret < 0) {
-            return ret;
-        }
-    }
-
-    return 0;
-}
-
-// APID 0x032
-int send_bulk_video_data(uint32_t transfer_id, uint8_t *video_buffer, uint32_t total_bytes) {
-    uint32_t total_chunks = (total_bytes + MAX_CHUNK_DATA - 1) / MAX_CHUNK_DATA;
-    uint8_t packet[NET_IPC_MAX_DATA];
-
-    for (uint32_t chunk = 0; chunk < total_chunks; chunk++) {
-        uint32_t start = chunk * MAX_CHUNK_DATA;
-        uint32_t remaining = total_bytes - start;
-        uint16_t count = (uint16_t)(remaining < MAX_CHUNK_DATA ? remaining : MAX_CHUNK_DATA);
-
-        int packet_len = pack_bulk_wrapper(packet, transfer_id, chunk, total_chunks, video_buffer + start, count);
-        int ret = link_send(STAR_APID_IMAGE_VIDEO_DATA, packet, (uint16_t)packet_len);
-        if (ret < 0) {
-            return ret;
-        }
-    }
-
-    return 0;
-}
-
-// APID 0x035
-int send_bulk_ack(uint32_t transfer_id, uint8_t status, uint32_t *missing_chunks, uint32_t num_missing_chunks) {
-    uint8_t buf[NET_IPC_MAX_DATA];
-    size_t off = 0;
-
-    if (status == 0x00) {
-        num_missing_chunks = 0;
-    } else if (num_missing_chunks > MAX_MISSING_CHUNKS) {
-        num_missing_chunks = MAX_MISSING_CHUNKS;
-    }
-
-    pack_be32(buf, &off, transfer_id);
-    pack_u8(buf, &off, status);
-    for (uint32_t i = 0; i < num_missing_chunks; i++) {
-        pack_be32(buf, &off, missing_chunks[i]);
-    }
-
-    return link_send(STAR_APID_BULK_DATA_RESPONSE, buf, (uint16_t)off);
 }
 
 static void sleep_ms(int ms) {
@@ -501,14 +562,20 @@ int main(int argc, char **argv) {
     const int serial_pfd_idx = 0;
     const int daemon_pfd_idx = 1;
 
-    pollfds[serial_pfd_idx].fd     = g_serial_fd;
-    pollfds[serial_pfd_idx].events = POLLIN;
     pollfds[daemon_pfd_idx].fd     = daemon_client_fd(&g_daemon);
     pollfds[daemon_pfd_idx].events = POLLIN;
 
     // Event Loop
     while (1) {
-        int ret = poll(pollfds, 2, -1);
+        pollfds[serial_pfd_idx].fd     = g_serial_fd;
+        pollfds[serial_pfd_idx].events = POLLIN | (g_inflight_active ? POLLOUT : 0);
+
+        // Outbound work (queued frames or an active file transfer) can't
+        // wait on an external event to make progress, so poll with a
+        // zero timeout and keep cycling through service_outbound() until
+        // it's all drained; otherwise block indefinitely like before.
+        int timeout_ms = outbound_work_pending() ? 0 : -1;
+        int ret = poll(pollfds, 2, timeout_ms);
 
         if (ret > 0) {
             if (pollfds[daemon_pfd_idx].revents & POLLIN) {
@@ -563,6 +630,8 @@ int main(int argc, char **argv) {
                 }
             }
         }
+
+        service_outbound();
     }
 
     return EXIT_SUCCESS;

@@ -10,6 +10,11 @@ add_subdirectory(PayloadApids)
 add_subdirectory(PayloadLink)
 add_subdirectory(Network)
 
+# Standalone busOBC-side harness (the other end of the RS-422 link from
+# Network/). Only needs PayloadApids/PayloadLink - it doesn't run alongside
+# daemond, so it has no dependency on Daemon.
+add_subdirectory(Obc)
+
 # daemond supervises Communications like any other managed process (see
 # register_network() in Daemon/src/main.c), so it needs to know where the
 # real build actually put the binary. Only available in this combined
