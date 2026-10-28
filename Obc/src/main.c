@@ -45,10 +45,19 @@
 #define BULK_ACK_HDR_LEN 5 // Transfer ID(4) + Status(1)
 #define MAX_MISSING_CHUNKS ((OBC_MAX_PACKET_LEN - BULK_ACK_HDR_LEN) / 4) // 126
 
-// Our own convention on top of the opaque payload-link body (same as
-// Network/src/main.c): | APID (2B BE) | LEN (2B BE) | DATA | zero pad |
-#define LINK_BODY_HDR_SIZE 4
+// Payload-link body: one complete CCSDS space packet (same as
+// Network/src/main.c): | CCSDS primary header (6B) | DATA |
+// Payload commands (APID 0x010) are telecommands and everything else is
+// telemetry; none carry a secondary header (ICD RevB D6).
+#define LINK_BODY_HDR_SIZE 6
 #define LINK_BODY_MAX_DATA (PL_MAX_BODY_LEN - LINK_BODY_HDR_SIZE)
+
+#define CCSDS_VERSION_MASK          UINT16_C(0xE000)
+#define CCSDS_TYPE_CMD              UINT16_C(0x1000)
+#define CCSDS_APID_MASK             UINT16_C(0x07FF)
+#define CCSDS_SEQ_FLAGS_MASK        UINT16_C(0xC000)
+#define CCSDS_SEQ_FLAGS_UNSEGMENTED UINT16_C(0xC000)
+#define CCSDS_SEQ_COUNT_MASK        UINT16_C(0x3FFF)
 _Static_assert(LINK_BODY_MAX_DATA >= OBC_MAX_PACKET_LEN,
                "payload-link body can't fit a full-size packet");
 
@@ -248,16 +257,21 @@ static int link_send(uint16_t apid, const uint8_t *payload, uint16_t payload_len
         return -1;
     }
 
-    uint8_t body[LINK_BODY_HDR_SIZE + LINK_BODY_MAX_DATA];
-    size_t  off = 0;
-    pack_be16(body, &off, apid);
-    pack_be16(body, &off, payload_len);
-    memcpy(body + off, payload, payload_len);
-    off += payload_len;
-    if (off < PL_MIN_BODY_LEN) {
-        memset(body + off, 0, PL_MIN_BODY_LEN - off);
-        off = PL_MIN_BODY_LEN;
+    static uint16_t tx_sequence_count;
+
+    uint8_t  body[LINK_BODY_HDR_SIZE + LINK_BODY_MAX_DATA];
+    uint16_t data_len = payload_len > 0 ? payload_len : 1;
+    uint16_t type     = apid == STAR_APID_PAYLOAD_COMMAND ? CCSDS_TYPE_CMD : 0;
+    size_t   off      = 0;
+    pack_be16(body, &off, type | (apid & CCSDS_APID_MASK));
+    pack_be16(body, &off, CCSDS_SEQ_FLAGS_UNSEGMENTED | tx_sequence_count);
+    pack_be16(body, &off, (uint16_t)(data_len - 1));
+    memset(body + off, 0, data_len);
+    if (payload_len > 0) {
+        memcpy(body + off, payload, payload_len);
     }
+    off += data_len;
+    tx_sequence_count = (tx_sequence_count + 1) & CCSDS_SEQ_COUNT_MASK;
 
     uint8_t frame[PL_MAX_FRAME_LEN];
     size_t  frame_len = plframe_encode(body, off, frame);
@@ -931,15 +945,25 @@ int main(int argc, char **argv) {
                                 printf("[obc] payload link up\n");
                             }
                             size_t off = 0;
-                            if (decoder.body_len < LINK_BODY_HDR_SIZE) {
+                            if (decoder.body_len <= LINK_BODY_HDR_SIZE) {
                                 fprintf(stderr, "[obc] runt payload-link body (%u bytes)\n", decoder.body_len);
                                 break;
                             }
-                            uint16_t apid     = unpack_be16(decoder.body, &off);
-                            uint16_t data_len = unpack_be16(decoder.body, &off);
-                            if ((size_t)off + data_len > decoder.body_len) {
-                                fprintf(stderr, "[obc] apid 0x%03X claims %u bytes, only %u in body\n", apid,
-                                        data_len, decoder.body_len);
+                            uint16_t id       = unpack_be16(decoder.body, &off);
+                            uint16_t sequence = unpack_be16(decoder.body, &off);
+                            uint16_t data_len = (uint16_t)(unpack_be16(decoder.body, &off) + 1);
+                            uint16_t apid     = id & CCSDS_APID_MASK;
+                            if ((id & CCSDS_VERSION_MASK) != 0) {
+                                fprintf(stderr, "[obc] dropped packet: CCSDS version is not 0\n");
+                                break;
+                            }
+                            if ((size_t)off + data_len != decoder.body_len) {
+                                fprintf(stderr, "[obc] apid 0x%03X: CCSDS length implies %u data bytes, body has %u\n",
+                                        apid, data_len, (unsigned)(decoder.body_len - off));
+                                break;
+                            }
+                            if ((sequence & CCSDS_SEQ_FLAGS_MASK) != CCSDS_SEQ_FLAGS_UNSEGMENTED) {
+                                fprintf(stderr, "[obc] apid 0x%03X: dropped segmented packet\n", apid);
                                 break;
                             }
                             dispatch_from_pay(apid, decoder.body + off, data_len);
