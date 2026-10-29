@@ -8,10 +8,15 @@
 // and bulk ACK/NACKs arriving from the OBC (APIDs 0x010, 0x020, 0x022,
 // 0x033-0x035).
 //
-// It never touches the serial link itself. It only talks to the "network"
-// process (Network/src/main.c) via daemond, using the net_ipc_hdr_t framing
-// in net_ipc.h: daemon_client_send(..., "network", ...) to transmit, and
-// DMSG_DELIVER frames from "network" for whatever the OBC sent.
+// It never touches the serial link itself, and it never packs ICD Section 5
+// wire bytes either: outbound traffic is handed to "network"
+// (Network/src/main.c) as semantic values over the NET_IPC_CTRL_SEND_*
+// control messages in net_ipc.h (a quaternion, a status code, a batch of
+// sensor entries), and "network" owns turning that into the actual wire
+// format - including fields like Request Counter / Command Counter that
+// are purely protocol bookkeeping, not application state. This process
+// still parses *inbound* bytes itself (APIDs 0x010/0x020/0x022/0x033-0x035)
+// since interpreting what the OBC sent is application logic, not framing.
 //
 // usage: payload_app [registration_name]
 
@@ -43,31 +48,25 @@
 #define ADCS_REQ_REQUEST_DCE        0xA0
 #define ADCS_REQ_RELINQUISH_DCE     0xA1
 
-// APIDs this process sends on / receives on (ICD Section 3.2).
+// APIDs this process receives on (ICD Section 3.2). Outbound traffic goes
+// through the NET_IPC_CTRL_SEND_* control messages instead of a real APID -
+// "network" is the one that stamps the APID once it's built the frame.
 #define APID_CMD_RX        0x010
-#define APID_TELEM_TX       0x011
-#define APID_CMD_RESP_TX    0x012
 #define APID_ADCS_TELEM_RX 0x020
-#define APID_ADCS_REQ_TX    0x021
 #define APID_ADCS_RESP_RX  0x022
-#define APID_BULK_CALC_TX   0x030
-#define APID_BULK_FT_TX     0x031
-#define APID_BULK_VID_TX    0x032
 #define APID_BULK_EXP_RX   0x033
 #define APID_BULK_CTRL_RX  0x034
 #define APID_BULK_ACK_BIDI  0x035
 
-// Bulk Data Transfer Wrapper layout, ICD Section 5.8.
+// Bulk Data Transfer Wrapper layout, ICD Section 5.8 - only needed here for
+// parsing inbound chunks (0x033/0x034); outbound chunking (0x030/0x031)
+// is "network"'s job now.
 #define BULK_WRAPPER_HEADER_SIZE 14
 #define MAX_CHUNK_DATA (NET_IPC_MAX_DATA - BULK_WRAPPER_HEADER_SIZE)
 
-#define BULK_CALC_ENTRY_SIZE 36
-#define MAX_CALC_ENTRIES_PER_CHUNK (MAX_CHUNK_DATA / BULK_CALC_ENTRY_SIZE)
-
-#define BULK_FT_ENTRY_SIZE 32
-#define MAX_FT_ENTRIES_PER_CHUNK (MAX_CHUNK_DATA / BULK_FT_ENTRY_SIZE)
-
-#define BULK_ACK_HEADER_SIZE 5
+// ICD Section 5.9: Transfer ID(4) + Status(1) + Chunks Received(4), before
+// the optional Missing Chunks list.
+#define BULK_ACK_HEADER_SIZE 9
 
 // Dummy reassembly limits for inbound bulk transfers (Section 5.8.4/5.8.5).
 // Real payload software would size this to whatever experiment
@@ -93,55 +92,8 @@ static void sleep_ms(int ms) {
     nanosleep(&ts, NULL);
 }
 
-// Bulk data entry structures, ICD Sections 5.8.1/5.8.2.
-struct bulk_calc_entry {
-    uint64_t mission_time;
-    float    angular_accel[3];
-    float    commanded_torque[4];
-};
-
-struct bulk_ft_entry {
-    uint64_t mission_time;
-    float    force_vector[3];
-    float    torque_vector[3];
-};
-
-// ---- packing helpers (mirrors Network/src/main.c) ----
-
-static inline void pack_u8(uint8_t *buf, size_t *off, uint8_t val) {
-    buf[*off] = val;
-    *off += 1;
-}
-
-static inline void pack_be16(uint8_t *buf, size_t *off, uint16_t val) {
-    uint16_t be = htobe16(val);
-    memcpy(buf + *off, &be, sizeof(be));
-    *off += sizeof(be);
-}
-
-static inline void pack_be32(uint8_t *buf, size_t *off, uint32_t val) {
-    uint32_t be = htobe32(val);
-    memcpy(buf + *off, &be, sizeof(be));
-    *off += sizeof(be);
-}
-
-static inline void pack_be64(uint8_t *buf, size_t *off, uint64_t val) {
-    uint64_t be = htobe64(val);
-    memcpy(buf + *off, &be, sizeof(be));
-    *off += sizeof(be);
-}
-
-static inline void pack_be_float(uint8_t *buf, size_t *off, float val) {
-    uint32_t bits;
-    memcpy(&bits, &val, sizeof(bits));
-    pack_be32(buf, off, bits);
-}
-
-static inline void pack_be_float_array(uint8_t *buf, size_t *off, const float *vals, int n) {
-    for (int i = 0; i < n; i++) {
-        pack_be_float(buf, off, vals[i]);
-    }
-}
+// ---- unpacking helpers for inbound bytes ("network" forwards these raw -
+// interpreting them is this process's job, not "network"'s) ----
 
 static inline uint8_t unpack_u8(const uint8_t *buf, size_t *off) {
     uint8_t val = buf[*off];
@@ -176,167 +128,92 @@ static inline void unpack_be_float_array(const uint8_t *buf, size_t *off, float 
     }
 }
 
-// ---- outbound message builders, ICD Section 5 ----
-
-// APID 0x011
-static size_t build_telemetry(const sim_state_t *s, uint8_t *out) {
-    size_t off = 0;
-    pack_be64(out, &off, s->met_ms);
-    pack_u8(out, &off, s->op_state);
-    pack_u8(out, &off, s->active_experiment_id);
-    pack_be_float(out, &off, s->cpu_temp_c);
-    pack_be32(out, &off, s->storage_mb_remaining);
-    return off;
-}
-
-// APID 0x012
-static size_t build_cmd_response(uint8_t opcode, uint8_t status, uint8_t *out) {
-    size_t off = 0;
-    pack_u8(out, &off, opcode);
-    pack_u8(out, &off, status);
-    return off;
-}
-
-// APID 0x021
-static size_t build_adcs_request(uint8_t request_type, const float quat[4], const float rates[3],
-                                  uint32_t duration_ms, uint8_t *out) {
-    size_t off = 0;
-    pack_u8(out, &off, request_type);
-    if (request_type != ADCS_REQ_REQUEST_DCE && request_type != ADCS_REQ_RELINQUISH_DCE) {
-        pack_be_float_array(out, &off, quat, 4);
-        pack_be_float_array(out, &off, rates, 3);
-        pack_be32(out, &off, duration_ms);
-    }
-    return off;
-}
-
 // Wraps `data` in net_ipc_hdr_t and hands it to the daemon to relay to the
-// "network" process. Fire-and-forget: a bad/absent peer surfaces later as a
-// DMSG_ERROR on our next recv, which the main loop just logs.
-static int send_to_network(daemon_client_t *c, uint16_t apid, const uint8_t *data, uint16_t len) {
-    uint8_t frame[sizeof(net_ipc_hdr_t) + NET_IPC_MAX_DATA];
-    net_ipc_hdr_t hdr = { .apid = apid, .len = len };
+// "network" process - used for the NET_IPC_CTRL_* control messages (network
+// builds the real ICD frame from these semantic values) and for
+// NET_IPC_CTRL_BULK_UPLOAD. Fire-and-forget: a bad/absent peer surfaces
+// later as a DMSG_ERROR on our next recv, which the main loop just logs.
+static int send_to_network(daemon_client_t *c, uint16_t ctrl_apid, const void *data, uint16_t len) {
+    uint8_t frame[sizeof(net_ipc_hdr_t) + NET_IPC_CTRL_MAX_DATA];
+    net_ipc_hdr_t hdr = { .apid = ctrl_apid, .len = len };
     memcpy(frame, &hdr, sizeof(hdr));
     memcpy(frame + sizeof(hdr), data, len);
     return daemon_client_send(c, NET_IPC_NETWORK_NAME, frame, (uint32_t)(sizeof(hdr) + len));
 }
 
 // ---- bulk data transfer, ICD Section 5.8 ----
+//
+// Entry-based transfers (calc/force-torque) hand "network" the semantic
+// entries and let it pack/chunk/send them (and assign the Transfer ID).
+// Video stays file-based like Daemon/src/video_uploader.c's real uploads -
+// this dummy just writes its synthetic frame to a scratch file first so it
+// can go through the same NET_IPC_CTRL_BULK_UPLOAD path instead of needing
+// its own chunking logic.
 
-static size_t pack_calc_entry(uint8_t *buf, const struct bulk_calc_entry *e) {
-    size_t off = 0;
-    pack_be64(buf, &off, e->mission_time);
-    pack_be_float_array(buf, &off, e->angular_accel, 3);
-    pack_be_float_array(buf, &off, e->commanded_torque, 4);
-    return off;
-}
-
-static size_t pack_ft_entry(uint8_t *buf, const struct bulk_ft_entry *e) {
-    size_t off = 0;
-    pack_be64(buf, &off, e->mission_time);
-    pack_be_float_array(buf, &off, e->force_vector, 3);
-    pack_be_float_array(buf, &off, e->torque_vector, 3);
-    return off;
-}
-
-// Packs the common Bulk Data Transfer Wrapper header + data, returns total
-// wrapper length.
-static size_t pack_bulk_wrapper(uint8_t *frame, uint32_t transfer_id, uint32_t chunk_seq, uint32_t total_chunks,
-                                 const uint8_t *data, uint16_t n) {
-    size_t off = 0;
-    pack_be32(frame, &off, transfer_id);
-    pack_be32(frame, &off, chunk_seq);
-    pack_be32(frame, &off, total_chunks);
-    pack_be16(frame, &off, n);
-    memcpy(frame + off, data, n);
-    off += n;
-    return off;
-}
-
-// Splits `data` (total_len bytes, already flattened/serialized) into
-// max_chunk_data-sized Bulk Data Transfer Wrapper chunks and sends each one
-// to "network" on `apid`.
-static void send_bulk(daemon_client_t *c, uint16_t apid, uint32_t transfer_id, const uint8_t *data,
-                       uint32_t total_len, uint16_t max_chunk_data) {
-    uint32_t total_chunks = (total_len + max_chunk_data - 1) / max_chunk_data;
-    if (total_chunks == 0) {
-        total_chunks = 1; // still send one (empty) chunk so the OBC sees the session
-    }
-
-    uint8_t wrapper[BULK_WRAPPER_HEADER_SIZE + MAX_CHUNK_DATA];
-    for (uint32_t chunk = 0; chunk < total_chunks; chunk++) {
-        uint32_t start     = chunk * max_chunk_data;
-        uint32_t remaining = total_len - start;
-        uint16_t n         = (uint16_t)(remaining < max_chunk_data ? remaining : max_chunk_data);
-
-        size_t wlen = pack_bulk_wrapper(wrapper, transfer_id, chunk, total_chunks, data + start, n);
-        send_to_network(c, apid, wrapper, (uint16_t)wlen);
-    }
-}
-
-static uint32_t g_next_transfer_id = 1;
+static uint32_t g_next_video_transfer_id = 1;
 
 // APID 0x030: a handful of dummy attitude-control-loop samples.
 static void send_bulk_calc_dummy(daemon_client_t *c, const sim_state_t *s) {
-    struct bulk_calc_entry entries[5];
-    for (int i = 0; i < 5; i++) {
-        entries[i].mission_time      = s->met_ms + (uint64_t)i * 100;
-        entries[i].angular_accel[0]  = 0.001f * (float)i;
-        entries[i].angular_accel[1]  = -0.002f * (float)i;
-        entries[i].angular_accel[2]  = 0.0f;
-        entries[i].commanded_torque[0] = 0.01f;
-        entries[i].commanded_torque[1] = 0.02f;
-        entries[i].commanded_torque[2] = 0.0f;
-        entries[i].commanded_torque[3] = -0.01f;
+    net_ipc_calc_data_t d = { .num_entries = 5 };
+    for (uint32_t i = 0; i < d.num_entries; i++) {
+        net_ipc_calc_entry_t *e = &d.entries[i];
+        e->mission_time        = s->met_ms + (uint64_t)i * 100;
+        e->angular_accel[0]    = 0.001f * (float)i;
+        e->angular_accel[1]    = -0.002f * (float)i;
+        e->angular_accel[2]    = 0.0f;
+        e->commanded_torque[0] = 0.01f;
+        e->commanded_torque[1] = 0.02f;
+        e->commanded_torque[2] = 0.0f;
+        e->commanded_torque[3] = -0.01f;
     }
-
-    uint8_t flat[5 * BULK_CALC_ENTRY_SIZE];
-    size_t  off = 0;
-    for (int i = 0; i < 5; i++) {
-        off += pack_calc_entry(flat + off, &entries[i]);
-    }
-
-    uint32_t tid = g_next_transfer_id++;
-    fprintf(stderr, "[payload_app] -> bulk calculation data transfer id=%u (5 entries)\n", tid);
-    send_bulk(c, APID_BULK_CALC_TX, tid, flat, (uint32_t)off, MAX_CALC_ENTRIES_PER_CHUNK * BULK_CALC_ENTRY_SIZE);
+    fprintf(stderr, "[payload_app] -> bulk calculation data (%u entries)\n", d.num_entries);
+    send_to_network(c, NET_IPC_CTRL_SEND_CALC_DATA, &d, sizeof(d));
 }
 
 // APID 0x031: a handful of dummy force-torque sensor samples.
 static void send_bulk_ft_dummy(daemon_client_t *c, const sim_state_t *s) {
-    struct bulk_ft_entry entries[5];
-    for (int i = 0; i < 5; i++) {
-        entries[i].mission_time    = s->met_ms + (uint64_t)i * 100;
-        entries[i].force_vector[0] = 0.1f * (float)i;
-        entries[i].force_vector[1] = -0.05f;
-        entries[i].force_vector[2] = 0.0f;
-        entries[i].torque_vector[0] = 0.0f;
-        entries[i].torque_vector[1] = 0.02f;
-        entries[i].torque_vector[2] = -0.01f * (float)i;
+    net_ipc_ft_data_t d = { .num_entries = 5 };
+    for (uint32_t i = 0; i < d.num_entries; i++) {
+        net_ipc_ft_entry_t *e = &d.entries[i];
+        e->mission_time     = s->met_ms + (uint64_t)i * 100;
+        e->force_vector[0]  = 0.1f * (float)i;
+        e->force_vector[1]  = -0.05f;
+        e->force_vector[2]  = 0.0f;
+        e->torque_vector[0] = 0.0f;
+        e->torque_vector[1] = 0.02f;
+        e->torque_vector[2] = -0.01f * (float)i;
     }
-
-    uint8_t flat[5 * BULK_FT_ENTRY_SIZE];
-    size_t  off = 0;
-    for (int i = 0; i < 5; i++) {
-        off += pack_ft_entry(flat + off, &entries[i]);
-    }
-
-    uint32_t tid = g_next_transfer_id++;
-    fprintf(stderr, "[payload_app] -> bulk force-torque data transfer id=%u (5 entries)\n", tid);
-    send_bulk(c, APID_BULK_FT_TX, tid, flat, (uint32_t)off, MAX_FT_ENTRIES_PER_CHUNK * BULK_FT_ENTRY_SIZE);
+    fprintf(stderr, "[payload_app] -> bulk force-torque data (%u entries)\n", d.num_entries);
+    send_to_network(c, NET_IPC_CTRL_SEND_FT_DATA, &d, sizeof(d));
 }
 
 // APID 0x032: a small dummy "video frame" (no entry structure - raw bytes
 // per ICD 5.8.3), deliberately larger than one chunk to exercise multi-chunk
 // reassembly on the OBC side.
+#define DUMMY_VIDEO_SCRATCH_PATH "/tmp/payload_app_dummy_video.bin"
+
 static void send_bulk_video_dummy(daemon_client_t *c) {
     uint8_t frame_data[1200];
     for (size_t i = 0; i < sizeof(frame_data); i++) {
         frame_data[i] = (uint8_t)(i & 0xFF);
     }
 
-    uint32_t tid = g_next_transfer_id++;
+    FILE *f = fopen(DUMMY_VIDEO_SCRATCH_PATH, "wb");
+    if (f == NULL || fwrite(frame_data, 1, sizeof(frame_data), f) != sizeof(frame_data)) {
+        fprintf(stderr, "[payload_app] failed to write dummy video scratch file %s: %s\n",
+                DUMMY_VIDEO_SCRATCH_PATH, strerror(errno));
+        if (f != NULL) {
+            fclose(f);
+        }
+        return;
+    }
+    fclose(f);
+
+    uint32_t              tid = g_next_video_transfer_id++;
+    net_ipc_bulk_upload_t req = { .transfer_id = tid };
+    strncpy(req.file_path, DUMMY_VIDEO_SCRATCH_PATH, sizeof(req.file_path) - 1);
     fprintf(stderr, "[payload_app] -> bulk video data transfer id=%u (%zu bytes)\n", tid, sizeof(frame_data));
-    send_bulk(c, APID_BULK_VID_TX, tid, frame_data, (uint32_t)sizeof(frame_data), MAX_CHUNK_DATA);
+    send_to_network(c, NET_IPC_CTRL_BULK_UPLOAD, &req, sizeof(req));
 }
 
 // Cycles through the three Pi -> OBC bulk data sources.
@@ -425,28 +302,33 @@ static void handle_bulk_chunk(bulk_rx_t *rx, daemon_client_t *c, const uint8_t *
     }
     rx->active = 0;
 
-    uint8_t resp[BULK_ACK_HEADER_SIZE];
-    size_t  roff = 0;
-    pack_be32(resp, &roff, transfer_id);
-    pack_u8(resp, &roff, 0x00); // ACK - a real implementation would NACK with
-                                // the gaps in rx->seen[] on a session timeout
-    send_to_network(c, APID_BULK_ACK_BIDI, resp, (uint16_t)roff);
+    // ACK - a real implementation would NACK with the gaps in rx->seen[] on
+    // a session timeout instead of only ever acking on completion.
+    net_ipc_bulk_ack_t ack = {
+        .transfer_id     = transfer_id,
+        .status          = 0x00,
+        .chunks_received = rx->chunks_received,
+        .num_missing     = 0,
+    };
+    send_to_network(c, NET_IPC_CTRL_SEND_BULK_ACK, &ack, sizeof(ack));
 }
 
 // APID 0x035, when it's the OBC responding to one of *our* 0x030/0x031/0x032
 // sends (as opposed to us responding to the OBC's 0x033/0x034 sends above).
 static void handle_bulk_ack_response(const uint8_t *data, uint16_t len) {
     if (len < BULK_ACK_HEADER_SIZE) return;
-    size_t   off          = 0;
-    uint32_t transfer_id  = unpack_be32(data, &off);
-    uint8_t  status        = unpack_u8(data, &off);
+    size_t   off             = 0;
+    uint32_t transfer_id     = unpack_be32(data, &off);
+    uint8_t  status           = unpack_u8(data, &off);
+    uint32_t chunks_received = unpack_be32(data, &off);
 
     if (status == 0x00) {
-        fprintf(stderr, "[payload_app] bulk transfer %u ACKed by OBC\n", transfer_id);
+        fprintf(stderr, "[payload_app] bulk transfer %u ACKed by OBC (%u chunks received)\n", transfer_id,
+                chunks_received);
     } else {
         uint32_t num_missing = (len - BULK_ACK_HEADER_SIZE) / 4;
-        fprintf(stderr, "[payload_app] bulk transfer %u NACKed by OBC, %u missing chunk(s)\n", transfer_id,
-                num_missing);
+        fprintf(stderr, "[payload_app] bulk transfer %u NACKed by OBC, %u chunks received so far, %u missing chunk(s)\n",
+                transfer_id, chunks_received, num_missing);
     }
 }
 
@@ -465,11 +347,12 @@ static void push_state(daemon_client_t *c, const sim_state_t *s) {
 }
 
 static void handle_payload_command(sim_state_t *s, daemon_client_t *c, const uint8_t *data, uint16_t len) {
-    if (len < 1) return;
-    size_t  off    = 0;
-    uint8_t opcode = unpack_u8(data, &off);
-    uint32_t arg   = (len >= 5) ? unpack_be32(data, &off) : 0;
-    uint8_t status = 0x00; // ACK unless noted otherwise
+    if (len < 3) return;
+    size_t   off             = 0;
+    uint8_t  opcode          = unpack_u8(data, &off);
+    uint16_t command_counter = unpack_be16(data, &off);
+    uint32_t arg             = (len >= 7) ? unpack_be32(data, &off) : 0;
+    uint8_t  status          = 0x00; // ACK unless noted otherwise
 
     switch (opcode) {
         case CMD_GRANT_DCE_AUTHORITY:
@@ -504,9 +387,8 @@ static void handle_payload_command(sim_state_t *s, daemon_client_t *c, const uin
             break;
     }
 
-    uint8_t resp[2];
-    size_t  rlen = build_cmd_response(opcode, status, resp);
-    send_to_network(c, APID_CMD_RESP_TX, resp, (uint16_t)rlen);
+    net_ipc_cmd_response_t resp = { .opcode = opcode, .command_counter = command_counter, .status = status };
+    send_to_network(c, NET_IPC_CTRL_SEND_CMD_RESPONSE, &resp, sizeof(resp));
     push_state(c, s);
 }
 
@@ -521,11 +403,13 @@ static void handle_adcs_telemetry(sim_state_t *s, const uint8_t *data, uint16_t 
 }
 
 static void handle_adcs_response(sim_state_t *s, daemon_client_t *c, const uint8_t *data, uint16_t len) {
-    if (len < 2) return;
-    uint8_t request_type = data[0];
-    uint8_t status        = data[1];
-    fprintf(stderr, "[payload_app] ADCS response: request_type=0x%02X status=%s\n", request_type,
-            status == 0x00 ? "ACK" : "NACK");
+    if (len < 4) return;
+    size_t   off            = 0;
+    uint8_t  request_type   = unpack_u8(data, &off);
+    uint16_t request_counter = unpack_be16(data, &off);
+    uint8_t  status          = unpack_u8(data, &off);
+    fprintf(stderr, "[payload_app] ADCS response: request_type=0x%02X counter=%u status=%s\n", request_type,
+            request_counter, status == 0x00 ? "ACK" : "NACK");
 
     if (request_type == ADCS_REQ_REQUEST_DCE) {
         s->dce_authority_held = (status == 0x00) ? 1 : 0;
@@ -576,33 +460,42 @@ static void handle_deliver(sim_state_t *s, daemon_client_t *c, const uint8_t *bu
 
 // Cycles through a short, harmless sequence of dummy commands so there's
 // always some ADCS request traffic to observe: request authority, ask for
-// an orientation, ask for a spin rate, then relinquish authority.
+// an orientation, ask for a spin rate, then relinquish authority. The
+// Request Counter is "network"'s to assign - this only supplies the
+// semantic fields the ICD defines (quat/rates/duration are zeroed by the
+// caller for 0xA0/0xA1 and ignored by the receiver; "network" still sends
+// them as the full fixed-size message).
 static void send_dummy_command(sim_state_t *s, daemon_client_t *c, int step) {
-    static const float quat[4]  = { 0.0f, 0.0f, 0.0f, 1.0f };
-    static const float rates[3] = { 0.01f, -0.02f, 0.00f };
-    uint8_t            buf[33];
-    size_t              len;
+    net_ipc_adcs_request_t req = { 0 };
 
     switch (step % 4) {
         case 0:
-            len = build_adcs_request(ADCS_REQ_REQUEST_DCE, quat, rates, 0, buf);
+            req.request_type = ADCS_REQ_REQUEST_DCE;
             fprintf(stderr, "[payload_app] -> ADCS request: request DCE authority\n");
             break;
         case 1:
-            len = build_adcs_request(ADCS_REQ_TARGET_ORIENTATION, quat, rates, 5000, buf);
+            req.request_type    = ADCS_REQ_TARGET_ORIENTATION;
+            req.target_quat[3]  = 1.0f;
+            req.target_rates[0] = 0.01f;
+            req.target_rates[1] = -0.02f;
+            req.duration_ms     = 5000;
             fprintf(stderr, "[payload_app] -> ADCS request: target orientation\n");
             break;
         case 2:
-            len = build_adcs_request(ADCS_REQ_TARGET_SPIN_RATE, quat, rates, 3000, buf);
+            req.request_type    = ADCS_REQ_TARGET_SPIN_RATE;
+            req.target_quat[3]  = 1.0f;
+            req.target_rates[0] = 0.01f;
+            req.target_rates[1] = -0.02f;
+            req.duration_ms     = 3000;
             fprintf(stderr, "[payload_app] -> ADCS request: target spin rate\n");
             break;
         default:
-            len = build_adcs_request(ADCS_REQ_RELINQUISH_DCE, quat, rates, 0, buf);
+            req.request_type = ADCS_REQ_RELINQUISH_DCE;
             fprintf(stderr, "[payload_app] -> ADCS request: relinquish DCE authority\n");
             break;
     }
 
-    send_to_network(c, APID_ADCS_REQ_TX, buf, (uint16_t)len);
+    send_to_network(c, NET_IPC_CTRL_SEND_ADCS_REQUEST, &req, sizeof(req));
     (void)s;
 }
 
@@ -698,9 +591,14 @@ int main(int argc, char **argv) {
         s.met_ms += 1000;
         s.cpu_temp_c = 35.0f + (float)(tick % 10) * 0.3f;
 
-        uint8_t telem[18];
-        size_t  telem_len = build_telemetry(&s, telem);
-        send_to_network(&c, APID_TELEM_TX, telem, (uint16_t)telem_len);
+        net_ipc_telemetry_t telem = {
+            .met_ms               = s.met_ms,
+            .op_state              = s.op_state,
+            .active_experiment_id = s.active_experiment_id,
+            .cpu_temp_c            = s.cpu_temp_c,
+            .storage_mb_remaining = s.storage_mb_remaining,
+        };
+        send_to_network(&c, NET_IPC_CTRL_SEND_TELEMETRY, &telem, sizeof(telem));
 
         if (tick % 5 == 0) {
             send_dummy_command(&s, &c, cmd_step++);

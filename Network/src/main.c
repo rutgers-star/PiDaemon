@@ -297,6 +297,161 @@ static int enqueue_send(uint16_t apid, const uint8_t *payload, uint16_t payload_
     return 0;
 }
 
+// ---- outbound message builders, ICD Section 5 ----
+//
+// Every message type below is built here from the semantic values an app
+// process hands us over the control APIDs in net_ipc.h, instead of the app
+// packing ICD Section 5 bytes itself: "network" owns the wire format,
+// including counters it tracks (Request Counter) and echoes (Command
+// Counter), and the Section 5.8 chunking for entry-based bulk data.
+
+static inline void pack_be_float(uint8_t *buf, size_t *off, float val) {
+    uint32_t bits;
+    memcpy(&bits, &val, sizeof(bits));
+    pack_be32(buf, off, bits);
+}
+
+static inline void pack_be_float_array(uint8_t *buf, size_t *off, const float *vals, int n) {
+    for (int i = 0; i < n; i++) {
+        pack_be_float(buf, off, vals[i]);
+    }
+}
+
+// APID 0x011
+static void send_telemetry(const net_ipc_telemetry_t *t) {
+    uint8_t buf[18];
+    size_t  off = 0;
+    pack_be64(buf, &off, t->met_ms);
+    pack_u8(buf, &off, t->op_state);
+    pack_u8(buf, &off, t->active_experiment_id);
+    pack_be_float(buf, &off, t->cpu_temp_c);
+    pack_be32(buf, &off, t->storage_mb_remaining);
+    enqueue_send(STAR_APID_PAYLOAD_TELEMETRY, buf, (uint16_t)off);
+}
+
+// APID 0x012
+static void send_cmd_response(const net_ipc_cmd_response_t *r) {
+    uint8_t buf[4];
+    size_t  off = 0;
+    pack_u8(buf, &off, r->opcode);
+    pack_be16(buf, &off, r->command_counter);
+    pack_u8(buf, &off, r->status);
+    enqueue_send(STAR_APID_PAYLOAD_COMMAND_RESPONSE, buf, (uint16_t)off);
+}
+
+// APID 0x021. Request Counter is "network"'s to assign (ICD 5.6: incremented
+// by the payOBC for each new request) - always sends the full fixed 35-byte
+// message, per the ICD's "message is 35 bytes for all request types" rule.
+static uint16_t g_adcs_request_counter;
+
+static void send_adcs_request(const net_ipc_adcs_request_t *req) {
+    uint8_t buf[35];
+    size_t  off = 0;
+    pack_u8(buf, &off, req->request_type);
+    pack_be16(buf, &off, g_adcs_request_counter++);
+    pack_be_float_array(buf, &off, req->target_quat, 4);
+    pack_be_float_array(buf, &off, req->target_rates, 3);
+    pack_be32(buf, &off, req->duration_ms);
+    enqueue_send(STAR_APID_ADCS_POINTING_REQUEST, buf, (uint16_t)off);
+}
+
+// APID 0x035. Includes Chunks Received (ICD 5.9 offset 5-8) between Status
+// and the Missing Chunks list - previously dropped on this wire format.
+static void send_bulk_ack(const net_ipc_bulk_ack_t *ack) {
+    uint32_t num_missing = ack->num_missing;
+    if (num_missing > NET_IPC_BULK_ACK_MAX_MISSING) {
+        num_missing = NET_IPC_BULK_ACK_MAX_MISSING;
+    }
+    uint8_t buf[9 + NET_IPC_BULK_ACK_MAX_MISSING * 4];
+    size_t  off = 0;
+    pack_be32(buf, &off, ack->transfer_id);
+    pack_u8(buf, &off, ack->status);
+    pack_be32(buf, &off, ack->chunks_received);
+    if (ack->status != 0x00) {
+        for (uint32_t i = 0; i < num_missing; i++) {
+            pack_be32(buf, &off, ack->missing[i]);
+        }
+    }
+    enqueue_send(STAR_APID_BULK_DATA_RESPONSE, buf, (uint16_t)off);
+}
+
+#define BULK_CALC_ENTRY_SIZE 36
+#define MAX_CALC_ENTRIES_PER_CHUNK (MAX_CHUNK_DATA / BULK_CALC_ENTRY_SIZE)
+#define BULK_FT_ENTRY_SIZE 32
+#define MAX_FT_ENTRIES_PER_CHUNK (MAX_CHUNK_DATA / BULK_FT_ENTRY_SIZE)
+
+static size_t pack_calc_entry(uint8_t *buf, const net_ipc_calc_entry_t *e) {
+    size_t off = 0;
+    pack_be64(buf, &off, e->mission_time);
+    pack_be_float_array(buf, &off, e->angular_accel, 3);
+    pack_be_float_array(buf, &off, e->commanded_torque, 4);
+    return off;
+}
+
+static size_t pack_ft_entry(uint8_t *buf, const net_ipc_ft_entry_t *e) {
+    size_t off = 0;
+    pack_be64(buf, &off, e->mission_time);
+    pack_be_float_array(buf, &off, e->force_vector, 3);
+    pack_be_float_array(buf, &off, e->torque_vector, 3);
+    return off;
+}
+
+// Transfer ID for entry-based bulk sends (ICD 5.8: "generated and assigned
+// by the transmitting device"). Video keeps its own caller-assigned ID
+// (NET_IPC_CTRL_BULK_UPLOAD) since that path is unchanged.
+static uint32_t g_next_bulk_transfer_id = 1;
+
+// Packs `num_entries` fixed-size entries (via `pack_entry`) into Section 5.8
+// Bulk Data Transfer Wrapper chunks of at most `entries_per_chunk` each, and
+// enqueues every chunk on `apid`. Shared by send_calc_data/send_ft_data.
+static void send_bulk_entries(uint16_t apid, const uint8_t *flat, uint32_t num_entries, size_t entry_size,
+                               uint32_t entries_per_chunk) {
+    uint32_t total_chunks = (num_entries + entries_per_chunk - 1) / entries_per_chunk;
+    if (total_chunks == 0) {
+        total_chunks = 1;
+    }
+    uint32_t tid = g_next_bulk_transfer_id++;
+
+    uint8_t wrapper[BULK_WRAPPER_HEADER_SIZE + MAX_CHUNK_DATA];
+    for (uint32_t chunk = 0; chunk < total_chunks; chunk++) {
+        uint32_t start     = chunk * entries_per_chunk;
+        uint32_t remaining = num_entries - start;
+        uint32_t count     = remaining < entries_per_chunk ? remaining : entries_per_chunk;
+        uint16_t n          = (uint16_t)(count * entry_size);
+
+        size_t wlen = pack_bulk_wrapper(wrapper, tid, chunk, total_chunks, flat + (size_t)start * entry_size, n);
+        enqueue_send(apid, wrapper, (uint16_t)wlen);
+    }
+}
+
+// APID 0x030
+static void send_calc_data(const net_ipc_calc_data_t *d) {
+    uint32_t n = d->num_entries;
+    if (n > NET_IPC_MAX_CALC_ENTRIES_PER_CALL) {
+        n = NET_IPC_MAX_CALC_ENTRIES_PER_CALL;
+    }
+    uint8_t flat[NET_IPC_MAX_CALC_ENTRIES_PER_CALL * BULK_CALC_ENTRY_SIZE];
+    size_t  off = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        off += pack_calc_entry(flat + off, &d->entries[i]);
+    }
+    send_bulk_entries(STAR_APID_PAYLOAD_CALCULATION_DATA, flat, n, BULK_CALC_ENTRY_SIZE, MAX_CALC_ENTRIES_PER_CHUNK);
+}
+
+// APID 0x031
+static void send_ft_data(const net_ipc_ft_data_t *d) {
+    uint32_t n = d->num_entries;
+    if (n > NET_IPC_MAX_FT_ENTRIES_PER_CALL) {
+        n = NET_IPC_MAX_FT_ENTRIES_PER_CALL;
+    }
+    uint8_t flat[NET_IPC_MAX_FT_ENTRIES_PER_CALL * BULK_FT_ENTRY_SIZE];
+    size_t  off = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        off += pack_ft_entry(flat + off, &d->entries[i]);
+    }
+    send_bulk_entries(STAR_APID_FORCE_TORQUE_SENSOR_DATA, flat, n, BULK_FT_ENTRY_SIZE, MAX_FT_ENTRIES_PER_CHUNK);
+}
+
 // Starts (or begins restarting, from offset 0) an outbound file transfer
 // requested via NET_IPC_CTRL_BULK_UPLOAD. "network" owns reading the file
 // from here on - the sender only told us where it is.
@@ -447,9 +602,11 @@ static int outbound_work_pending(void) {
 }
 
 // Handles one frame delivered by the daemon from a payload application
-// process. NET_IPC_CTRL_BULK_UPLOAD starts a file transfer (see above);
-// anything else unwraps the net_ipc_hdr_t as-is and enqueues it for sending
-// out over the serial link on the APID it names.
+// process. Every control APID below carries semantic values for one ICD
+// Section 5 message; "network" is the only place that packs the actual
+// wire bytes (see the builders above NET_IPC_CTRL_BULK_UPLOAD's handler),
+// so there's deliberately no generic "send these raw bytes on this APID"
+// fallback here for an app to bypass that with.
 static void handle_app_delivery(const uint8_t *buf, uint32_t len) {
     if (len < sizeof(net_ipc_hdr_t)) {
         fprintf(stderr, "[network] short net_ipc frame from app (%u bytes)\n", len);
@@ -463,19 +620,57 @@ static void handle_app_delivery(const uint8_t *buf, uint32_t len) {
         return;
     }
 
-    if (hdr.apid == NET_IPC_CTRL_BULK_UPLOAD) {
-        handle_bulk_upload(data, hdr.len);
-        return;
+    switch (hdr.apid) {
+        case NET_IPC_CTRL_BULK_UPLOAD:
+            handle_bulk_upload(data, hdr.len);
+            return;
+        case NET_IPC_CTRL_SEND_TELEMETRY: {
+            net_ipc_telemetry_t req;
+            if (hdr.len < sizeof(req)) break;
+            memcpy(&req, data, sizeof(req));
+            send_telemetry(&req);
+            return;
+        }
+        case NET_IPC_CTRL_SEND_CMD_RESPONSE: {
+            net_ipc_cmd_response_t req;
+            if (hdr.len < sizeof(req)) break;
+            memcpy(&req, data, sizeof(req));
+            send_cmd_response(&req);
+            return;
+        }
+        case NET_IPC_CTRL_SEND_ADCS_REQUEST: {
+            net_ipc_adcs_request_t req;
+            if (hdr.len < sizeof(req)) break;
+            memcpy(&req, data, sizeof(req));
+            send_adcs_request(&req);
+            return;
+        }
+        case NET_IPC_CTRL_SEND_BULK_ACK: {
+            net_ipc_bulk_ack_t req;
+            if (hdr.len < sizeof(req)) break;
+            memcpy(&req, data, sizeof(req));
+            send_bulk_ack(&req);
+            return;
+        }
+        case NET_IPC_CTRL_SEND_CALC_DATA: {
+            net_ipc_calc_data_t req;
+            if (hdr.len < sizeof(req)) break;
+            memcpy(&req, data, sizeof(req));
+            send_calc_data(&req);
+            return;
+        }
+        case NET_IPC_CTRL_SEND_FT_DATA: {
+            net_ipc_ft_data_t req;
+            if (hdr.len < sizeof(req)) break;
+            memcpy(&req, data, sizeof(req));
+            send_ft_data(&req);
+            return;
+        }
+        default:
+            fprintf(stderr, "[network] app requested send on unknown control apid 0x%04X\n", hdr.apid);
+            return;
     }
-
-    if (!star_payload_apid_allowed_pay_to_bus(hdr.apid)) {
-        fprintf(stderr, "[network] app requested send on unroutable apid 0x%03X\n", hdr.apid);
-        return;
-    }
-
-    if (enqueue_send(hdr.apid, data, hdr.len) < 0) {
-        fprintf(stderr, "[network] failed to enqueue apid 0x%03X\n", hdr.apid);
-    }
+    fprintf(stderr, "[network] short control payload from app (apid=0x%04X len=%u)\n", hdr.apid, hdr.len);
 }
 
 static void sleep_ms(int ms) {
