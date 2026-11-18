@@ -1,0 +1,7 @@
+- Remove all dynamic allocations
+- Create payload app with controls (rewrite Python to C maybe)
+- Request retransmission and retransmit data
+- Persist transfer id and sent chunks for bulk transfer
+- Clean up the IPC communication for network process
+- Change OS
+- FIX APIDS

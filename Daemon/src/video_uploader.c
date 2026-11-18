@@ -35,12 +35,12 @@ static void sleep_ms(int ms) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <video-file> [registration-name]\n", argv[0]);
+    if (argc < 1) {
+        fprintf(stderr, "usage: %s <video-file>\n", argv[0]);
         return 1;
     }
     const char *file_path = argv[1];
-    const char *name      = argc > 2 ? argv[2] : "video_uploader";
+    const char *name      = "video_uploader";
 
     if (strlen(file_path) >= NET_IPC_BULK_UPLOAD_PATH_MAX) {
         fprintf(stderr, "[%s] path too long for the upload request (max %d chars): %s\n", name,
@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
     }
 
     daemon_client_t c;
-    int              connected = 0;
+    int connected = 0;
     for (int attempt = 0; attempt < 10 && !connected; attempt++) {
         if (daemon_client_connect(name, &c) == 0) {
             connected = 1;
@@ -69,11 +69,11 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "[%s] connected and registered\n", name);
 
-    uint32_t              transfer_id = (uint32_t)time(NULL);
-    net_ipc_bulk_upload_t req         = { .transfer_id = transfer_id };
+    uint32_t transfer_id = (uint32_t)time(NULL);
+    net_ipc_bulk_upload_t req = { .transfer_id = transfer_id };
     strncpy(req.file_path, file_path, sizeof(req.file_path) - 1);
 
-    uint8_t       frame[sizeof(net_ipc_hdr_t) + sizeof(req)];
+    uint8_t frame[sizeof(net_ipc_hdr_t) + sizeof(req)];
     net_ipc_hdr_t hdr = { .apid = NET_IPC_CTRL_BULK_UPLOAD, .len = sizeof(req) };
     memcpy(frame, &hdr, sizeof(hdr));
     memcpy(frame + sizeof(hdr), &req, sizeof(req));

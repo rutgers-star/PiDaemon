@@ -409,12 +409,6 @@ void ipc_server_service(ipc_server_t *srv, struct pollfd *fds, int n, satellite_
 
         if (rev & POLLIN) {
             // EOF/error defers should_close until after the dispatch loop
-            // below, not set immediately here: recv() can return a final
-            // message's bytes and then, in the very next call in this same
-            // loop, 0 (EOF) - the message is already sitting in rxbuf at
-            // that point and must still be dispatched, or a peer that sends
-            // one message and immediately closes (every run of
-            // video_uploader) gets it silently dropped.
             int eof_or_err = 0;
             for (;;) {
                 ssize_t nrecv = recv(c->fd, c->rxbuf + c->rx_len, sizeof(c->rxbuf) - c->rx_len, 0);
@@ -462,12 +456,6 @@ void ipc_server_service(ipc_server_t *srv, struct pollfd *fds, int n, satellite_
             }
         }
 
-        // Checked after draining POLLIN above, not before: a peer that
-        // writes its last message and closes immediately can set POLLHUP
-        // in the very same poll() wakeup as POLLIN, and that still-buffered
-        // data must be read before honoring the close, or it's silently
-        // lost - exactly what a one-shot "send one message and exit"
-        // client (video_uploader) does on every run.
         if (!c->should_close && (rev & (POLLHUP | POLLERR | POLLNVAL))) {
             c->should_close = 1;
         }

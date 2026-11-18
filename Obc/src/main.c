@@ -42,13 +42,22 @@
 #define OBC_MAX_PACKET_LEN 512 // ICD MAX_PACKET_LENGTH
 #define BULK_WRAPPER_HDR_LEN 14 // Transfer ID(4) + Chunk Seq(4) + Total Chunks(4) + Chunk Size(2)
 #define MAX_CHUNK_DATA (OBC_MAX_PACKET_LEN - BULK_WRAPPER_HDR_LEN) // 498
-#define BULK_ACK_HDR_LEN 5 // Transfer ID(4) + Status(1)
-#define MAX_MISSING_CHUNKS ((OBC_MAX_PACKET_LEN - BULK_ACK_HDR_LEN) / 4) // 126
+#define BULK_ACK_HDR_LEN 9 // Transfer ID(4) + Status(1) + Chunks Received(4)
+#define MAX_MISSING_CHUNKS ((OBC_MAX_PACKET_LEN - BULK_ACK_HDR_LEN) / 4) // 125, matches ICD 5.9's cap
 
-// Our own convention on top of the opaque payload-link body (same as
-// Network/src/main.c): | APID (2B BE) | LEN (2B BE) | DATA | zero pad |
-#define LINK_BODY_HDR_SIZE 4
+// Payload-link body: one complete CCSDS space packet (same as
+// Network/src/main.c): | CCSDS primary header (6B) | DATA |
+// Payload commands (APID 0x010) are telecommands and everything else is
+// telemetry; none carry a secondary header (ICD RevB D6).
+#define LINK_BODY_HDR_SIZE 6
 #define LINK_BODY_MAX_DATA (PL_MAX_BODY_LEN - LINK_BODY_HDR_SIZE)
+
+#define CCSDS_VERSION_MASK          UINT16_C(0xE000)
+#define CCSDS_TYPE_CMD              UINT16_C(0x1000)
+#define CCSDS_APID_MASK             UINT16_C(0x07FF)
+#define CCSDS_SEQ_FLAGS_MASK        UINT16_C(0xC000)
+#define CCSDS_SEQ_FLAGS_UNSEGMENTED UINT16_C(0xC000)
+#define CCSDS_SEQ_COUNT_MASK        UINT16_C(0x3FFF)
 _Static_assert(LINK_BODY_MAX_DATA >= OBC_MAX_PACKET_LEN,
                "payload-link body can't fit a full-size packet");
 
@@ -248,16 +257,21 @@ static int link_send(uint16_t apid, const uint8_t *payload, uint16_t payload_len
         return -1;
     }
 
-    uint8_t body[LINK_BODY_HDR_SIZE + LINK_BODY_MAX_DATA];
-    size_t  off = 0;
-    pack_be16(body, &off, apid);
-    pack_be16(body, &off, payload_len);
-    memcpy(body + off, payload, payload_len);
-    off += payload_len;
-    if (off < PL_MIN_BODY_LEN) {
-        memset(body + off, 0, PL_MIN_BODY_LEN - off);
-        off = PL_MIN_BODY_LEN;
+    static uint16_t tx_sequence_count;
+
+    uint8_t  body[LINK_BODY_HDR_SIZE + LINK_BODY_MAX_DATA];
+    uint16_t data_len = payload_len > 0 ? payload_len : 1;
+    uint16_t type     = apid == STAR_APID_PAYLOAD_COMMAND ? CCSDS_TYPE_CMD : 0;
+    size_t   off      = 0;
+    pack_be16(body, &off, type | (apid & CCSDS_APID_MASK));
+    pack_be16(body, &off, CCSDS_SEQ_FLAGS_UNSEGMENTED | tx_sequence_count);
+    pack_be16(body, &off, (uint16_t)(data_len - 1));
+    memset(body + off, 0, data_len);
+    if (payload_len > 0) {
+        memcpy(body + off, payload, payload_len);
     }
+    off += data_len;
+    tx_sequence_count = (tx_sequence_count + 1) & CCSDS_SEQ_COUNT_MASK;
 
     uint8_t frame[PL_MAX_FRAME_LEN];
     size_t  frame_len = plframe_encode(body, off, frame);
@@ -271,20 +285,26 @@ static int link_send(uint16_t apid, const uint8_t *payload, uint16_t payload_len
 
 // ---- outbound message builders, ICD Section 5 ----
 
-// APID 0x010
+// APID 0x010. Command Counter is the busOBC's to assign (ICD 5.2:
+// incremented by the busOBC for each new command).
+static uint16_t g_command_counter;
+
 static int send_command(uint8_t opcode, uint32_t arg) {
-    uint8_t buf[5];
+    uint8_t buf[7];
     size_t  off = 0;
     pack_u8(buf, &off, opcode);
+    pack_be16(buf, &off, g_command_counter++);
     pack_be32(buf, &off, arg);
     return link_send(STAR_APID_PAYLOAD_COMMAND, buf, (uint16_t)off);
 }
 
-// APID 0x022
-static int send_adcs_response(uint8_t request_type, uint8_t status) {
-    uint8_t buf[2];
+// APID 0x022. request_counter is copied from the request being responded to
+// (ICD 5.7), not assigned here.
+static int send_adcs_response(uint8_t request_type, uint16_t request_counter, uint8_t status) {
+    uint8_t buf[4];
     size_t  off = 0;
     pack_u8(buf, &off, request_type);
+    pack_be16(buf, &off, request_counter);
     pack_u8(buf, &off, status);
     return link_send(STAR_APID_ADCS_REQUEST_RESPONSE, buf, (uint16_t)off);
 }
@@ -314,8 +334,10 @@ static void send_adcs_telemetry_tick(void) {
     link_send(STAR_APID_ADCS_TELEMETRY_PASSTHROUGH, buf, (uint16_t)off);
 }
 
-// APID 0x035
-static int send_bulk_ack(uint32_t transfer_id, uint8_t status, const uint32_t *missing, uint32_t num_missing) {
+// APID 0x035. Includes Chunks Received (ICD 5.9 offset 5-8) between Status
+// and the Missing Chunks list.
+static int send_bulk_ack(uint32_t transfer_id, uint8_t status, uint32_t chunks_received, const uint32_t *missing,
+                          uint32_t num_missing) {
     if (num_missing > MAX_MISSING_CHUNKS) {
         num_missing = MAX_MISSING_CHUNKS;
     }
@@ -323,6 +345,7 @@ static int send_bulk_ack(uint32_t transfer_id, uint8_t status, const uint32_t *m
     size_t  off = 0;
     pack_be32(buf, &off, transfer_id);
     pack_u8(buf, &off, status);
+    pack_be32(buf, &off, chunks_received);
     for (uint32_t i = 0; i < num_missing; i++) {
         pack_be32(buf, &off, missing[i]);
     }
@@ -545,7 +568,7 @@ static void bulk_rx_feed_chunk(bulk_rx_t *rx, const uint8_t *data, uint16_t len)
     fclose(rx->f);
     rx->f = NULL;
     printf("[obc] %s transfer %u complete -> %s (%u chunks)\n", rx->label, transfer_id, rx->path, rx->total_chunks);
-    send_bulk_ack(transfer_id, 0x00, NULL, 0);
+    send_bulk_ack(transfer_id, 0x00, rx->total_chunks, NULL, 0);
     free(rx->received);
     rx->received = NULL;
     rx->active    = 0;
@@ -568,7 +591,7 @@ static void bulk_rx_check_timeout(bulk_rx_t *rx, time_t now) {
     }
     fprintf(stderr, "[obc] %s transfer %u stalled (%u/%u chunks) - NACKing %u missing chunk(s)\n", rx->label,
             rx->transfer_id, rx->chunks_received, rx->total_chunks, num_missing);
-    send_bulk_ack(rx->transfer_id, 0x01, missing, num_missing);
+    send_bulk_ack(rx->transfer_id, 0x01, rx->chunks_received, missing, num_missing);
     rx->last_chunk_time = now;
 }
 
@@ -592,59 +615,61 @@ static void handle_payload_telemetry(const uint8_t *data, uint16_t len) {
 }
 
 static void handle_payload_command_response(const uint8_t *data, uint16_t len) {
-    if (len < 2) {
+    if (len < 4) {
         return;
     }
-    size_t  off    = 0;
-    uint8_t opcode = unpack_u8(data, &off);
-    uint8_t status = unpack_u8(data, &off);
-    printf("[obc] <- command response opcode=0x%02X status=%s\n", opcode, status == 0x00 ? "ACK" : "NACK");
+    size_t   off              = 0;
+    uint8_t  opcode           = unpack_u8(data, &off);
+    uint16_t command_counter = unpack_be16(data, &off);
+    uint8_t  status            = unpack_u8(data, &off);
+    printf("[obc] <- command response opcode=0x%02X counter=%u status=%s\n", opcode, command_counter,
+           status == 0x00 ? "ACK" : "NACK");
 }
 
 // APID 0x021. The ICD notes the busOBC "retains the authority to veto"
 // these; this harness always ACKs - a real flight software ADCS/safety
 // check (torque limits, current mode, etc., ICD Section 4.3) would replace
-// that policy here.
+// that policy here. The message is a fixed 35 bytes for every request type
+// (ICD 5.6): Request Type(1) + Request Counter(2) + Target Quaternion(16) +
+// Target Angular Rates(12) + Duration(4), with the quat/rates/duration
+// fields transmitted as zero (and ignored here) for 0xA0/0xA1/0xA2.
 static void handle_adcs_pointing_request(const uint8_t *data, uint16_t len) {
-    if (len < 1) {
-        fprintf(stderr, "[obc] runt ADCS pointing request\n");
+    if (len < 35) {
+        fprintf(stderr, "[obc] runt ADCS pointing request (%u bytes)\n", len);
         return;
     }
-    size_t  off          = 0;
-    uint8_t request_type = unpack_u8(data, &off);
+    size_t   off              = 0;
+    uint8_t  request_type     = unpack_u8(data, &off);
+    uint16_t request_counter = unpack_be16(data, &off);
 
     switch (request_type) {
         case ADCS_REQ_TARGET_ORIENTATION:
         case ADCS_REQ_TARGET_SPIN_RATE: {
             float    quat[4]  = { 0 };
             float    rates[3] = { 0 };
-            uint32_t duration = 0;
-            if (len >= 29) {
-                unpack_be_float_array(data, &off, quat, 4);
-                unpack_be_float_array(data, &off, rates, 3);
-            }
-            if (len >= 33) {
-                duration = unpack_be32(data, &off);
-            }
-            printf("[obc] <- ADCS pointing request: %s quat=[%.3f %.3f %.3f %.3f] rates=[%.3f %.3f %.3f] "
+            unpack_be_float_array(data, &off, quat, 4);
+            unpack_be_float_array(data, &off, rates, 3);
+            uint32_t duration = unpack_be32(data, &off);
+            printf("[obc] <- ADCS pointing request: %s counter=%u quat=[%.3f %.3f %.3f %.3f] rates=[%.3f %.3f %.3f] "
                    "duration=%ums\n",
                    request_type == ADCS_REQ_TARGET_ORIENTATION ? "target orientation" : "target spin rate",
-                   (double)quat[0], (double)quat[1], (double)quat[2], (double)quat[3], (double)rates[0],
-                   (double)rates[1], (double)rates[2], duration);
+                   request_counter, (double)quat[0], (double)quat[1], (double)quat[2], (double)quat[3],
+                   (double)rates[0], (double)rates[1], (double)rates[2], duration);
             break;
         }
         case ADCS_REQ_REQUEST_DCE:
-            printf("[obc] <- ADCS pointing request: request DCE authority\n");
+            printf("[obc] <- ADCS pointing request: request DCE authority (counter=%u)\n", request_counter);
             break;
         case ADCS_REQ_RELINQUISH_DCE:
-            printf("[obc] <- ADCS pointing request: relinquish DCE authority\n");
+            printf("[obc] <- ADCS pointing request: relinquish DCE authority (counter=%u)\n", request_counter);
             break;
         default:
-            printf("[obc] <- ADCS pointing request: unknown type 0x%02X\n", request_type);
+            printf("[obc] <- ADCS pointing request: unknown type 0x%02X (counter=%u)\n", request_type,
+                   request_counter);
             break;
     }
 
-    send_adcs_response(request_type, 0x00);
+    send_adcs_response(request_type, request_counter, 0x00);
 
     if (request_type == ADCS_REQ_REQUEST_DCE) {
         g_dce_held_by_pay = 1;
@@ -661,17 +686,19 @@ static void handle_bulk_data_response(const uint8_t *data, uint16_t len) {
     if (len < BULK_ACK_HDR_LEN) {
         return;
     }
-    size_t   off          = 0;
-    uint32_t transfer_id  = unpack_be32(data, &off);
-    uint8_t  status        = unpack_u8(data, &off);
-    uint32_t num_missing   = (uint32_t)(len - BULK_ACK_HDR_LEN) / 4;
-    const char *label      = find_and_clear_pending_send(transfer_id);
+    size_t   off             = 0;
+    uint32_t transfer_id     = unpack_be32(data, &off);
+    uint8_t  status           = unpack_u8(data, &off);
+    uint32_t chunks_received = unpack_be32(data, &off);
+    uint32_t num_missing      = (uint32_t)(len - BULK_ACK_HDR_LEN) / 4;
+    const char *label         = find_and_clear_pending_send(transfer_id);
 
     if (status == 0x00) {
-        printf("[obc] <- bulk transfer %u (%s) ACKed by payload\n", transfer_id, label != NULL ? label : "?");
+        printf("[obc] <- bulk transfer %u (%s) ACKed by payload (%u chunks received)\n", transfer_id,
+               label != NULL ? label : "?", chunks_received);
     } else {
-        printf("[obc] <- bulk transfer %u (%s) NACKed by payload, %u missing chunk(s)\n", transfer_id,
-               label != NULL ? label : "?", num_missing);
+        printf("[obc] <- bulk transfer %u (%s) NACKed by payload, %u chunks received, %u missing chunk(s)\n",
+               transfer_id, label != NULL ? label : "?", chunks_received, num_missing);
     }
 }
 
@@ -931,15 +958,25 @@ int main(int argc, char **argv) {
                                 printf("[obc] payload link up\n");
                             }
                             size_t off = 0;
-                            if (decoder.body_len < LINK_BODY_HDR_SIZE) {
+                            if (decoder.body_len <= LINK_BODY_HDR_SIZE) {
                                 fprintf(stderr, "[obc] runt payload-link body (%u bytes)\n", decoder.body_len);
                                 break;
                             }
-                            uint16_t apid     = unpack_be16(decoder.body, &off);
-                            uint16_t data_len = unpack_be16(decoder.body, &off);
-                            if ((size_t)off + data_len > decoder.body_len) {
-                                fprintf(stderr, "[obc] apid 0x%03X claims %u bytes, only %u in body\n", apid,
-                                        data_len, decoder.body_len);
+                            uint16_t id       = unpack_be16(decoder.body, &off);
+                            uint16_t sequence = unpack_be16(decoder.body, &off);
+                            uint16_t data_len = (uint16_t)(unpack_be16(decoder.body, &off) + 1);
+                            uint16_t apid     = id & CCSDS_APID_MASK;
+                            if ((id & CCSDS_VERSION_MASK) != 0) {
+                                fprintf(stderr, "[obc] dropped packet: CCSDS version is not 0\n");
+                                break;
+                            }
+                            if ((size_t)off + data_len != decoder.body_len) {
+                                fprintf(stderr, "[obc] apid 0x%03X: CCSDS length implies %u data bytes, body has %u\n",
+                                        apid, data_len, (unsigned)(decoder.body_len - off));
+                                break;
+                            }
+                            if ((sequence & CCSDS_SEQ_FLAGS_MASK) != CCSDS_SEQ_FLAGS_UNSEGMENTED) {
+                                fprintf(stderr, "[obc] apid 0x%03X: dropped segmented packet\n", apid);
                                 break;
                             }
                             dispatch_from_pay(apid, decoder.body + off, data_len);

@@ -159,8 +159,7 @@ static void register_video_uploader(process_manager_t *pm, const char *bin_dir) 
     snprintf(video_uploader.name, sizeof(video_uploader.name), "video_uploader");
     snprintf(video_uploader.path, sizeof(video_uploader.path), "%s/video_uploader", bin_dir);
     video_uploader.argv[1] = (char *)video_path;
-    video_uploader.argv[2] = "video_uploader";
-    video_uploader.argv[3] = NULL;
+    video_uploader.argv[2] = NULL;
     video_uploader.restart = RESTART_NEVER;
     pm_add(pm, &video_uploader);
 }
